@@ -1227,6 +1227,7 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
         std::vector<int16_t> chunk;
         if (as->pop_audio_queue(chunk)) {
             switch_buffer_write(tech_pvt->playback_buffer, chunk.data(), chunk.size() * sizeof(int16_t));
+            inuse = switch_buffer_inuse(tech_pvt->playback_buffer);
             chunk_enqueued = true;
         }
     }
