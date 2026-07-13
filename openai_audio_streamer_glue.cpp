@@ -61,6 +61,34 @@ static bool json_depth_exceeded(const char *s, int max_depth) {
     return false;
 }
 
+enum class JsonMessageType {
+    Error,
+    SpeechStarted,
+    SpeechStopped,
+    AudioDelta,
+    AudioDone,
+    Unknown,
+};
+
+static JsonMessageType classify_json_message(const char *type) {
+    if (strstr(type, "error")) {
+        return JsonMessageType::Error;
+    }
+    if (strcmp(type, "input_audio_buffer.speech_started") == 0) {
+        return JsonMessageType::SpeechStarted;
+    }
+    if (strcmp(type, "input_audio_buffer.speech_stopped") == 0) {
+        return JsonMessageType::SpeechStopped;
+    }
+    if (strcmp(type, "response.output_audio.delta") == 0) {
+        return JsonMessageType::AudioDelta;
+    }
+    if (strcmp(type, "response.output_audio.done") == 0) {
+        return JsonMessageType::AudioDone;
+    }
+    return JsonMessageType::Unknown;
+}
+
 // Persistent buffers for stream_frame to avoid per-frame heap allocations
 struct StreamBuffers {
     std::vector<uint8_t> flush_buffer;
@@ -507,99 +535,115 @@ class AudioStreamer {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "processMessage type: %s\n",
                               jsType ? jsType : "null");
         }
+        if (!jsType) {
+            cJSON_Delete(json);
+            return status;
+        }
 
-        if (jsType && strstr(jsType, "error")) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                              "(%s) processMessage - error: %s\n", m_sessionId.c_str(), message.c_str());
+        switch (classify_json_message(jsType)) {
+            case JsonMessageType::Error:
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                  "(%s) processMessage - error: %s\n", m_sessionId.c_str(), message.c_str());
+                break;
 
-        } else if (jsType && strcmp(jsType, "input_audio_buffer.speech_started") == 0) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-                              "(%s) processMessage - user speech started, stopping openai audio playback\n",
-                              m_sessionId.c_str());
-            clear_audio_queue();
-            // also clear the private_t playback buffer used in write frame
-            request_playback_clear();
-            // remember which response was interrupted so its late deltas can be dropped
-            if (!m_current_response_id.empty()) {
-                m_cancelled_response_id = m_current_response_id;
-                m_has_cancelled_response = true;
-            }
-
-        } else if (jsType && strcmp(jsType, "input_audio_buffer.speech_stopped") == 0) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-                              "(%s) processMessage - user speech stopped\n", m_sessionId.c_str());
-
-        } else if (jsType && strcmp(jsType, "response.output_audio.delta") == 0) {
-            // Drop late deltas belonging to a response interrupted by barge-in: they would
-            // otherwise be queued and replayed over the new response. A delta from a different
-            // response clears the cancelled state and is played normally.
-            const char *response_id = cJSON_GetObjectCstr(json, "response_id");
-            if (response_id) {
-                if (m_has_cancelled_response && m_cancelled_response_id == response_id) {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-                                      "(%s) processMessage - dropping delta from cancelled response %s\n",
-                                      m_sessionId.c_str(), response_id);
-                    cJSON_Delete(json);
-                    return SWITCH_TRUE; // handled: do not forward the stale base64 payload
+            case JsonMessageType::SpeechStarted:
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                                  "(%s) processMessage - user speech started, stopping openai audio playback\n",
+                                  m_sessionId.c_str());
+                clear_audio_queue();
+                // also clear the private_t playback buffer used in write frame
+                request_playback_clear();
+                // remember which response was interrupted so its late deltas can be dropped
+                if (!m_current_response_id.empty()) {
+                    m_cancelled_response_id = m_current_response_id;
+                    m_has_cancelled_response = true;
                 }
-                m_has_cancelled_response = false;
-                m_current_response_id = response_id;
-            }
+                break;
 
-            const char *jsonAudio = cJSON_GetObjectCstr(json, "delta");
-            m_response_audio_done = false;
+            case JsonMessageType::SpeechStopped:
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                                  "(%s) processMessage - user speech stopped\n", m_sessionId.c_str());
+                break;
 
-            if (jsonAudio && strlen(jsonAudio) > 0) {
-                std::string rawAudio;
-                try {
-                    rawAudio = base64_decode(jsonAudio);
-                } catch (const std::exception& e) {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                      "(%s) processMessage - base64 decode error: %s\n", m_sessionId.c_str(), e.what());
-                    cJSON_Delete(json);
-                    return status;
+            case JsonMessageType::AudioDelta: {
+                // Drop late deltas belonging to a response interrupted by barge-in: they would
+                // otherwise be queued and replayed over the new response. A delta from a different
+                // response clears the cancelled state and is played normally.
+                const char *response_id = cJSON_GetObjectCstr(json, "response_id");
+                if (response_id) {
+                    if (m_has_cancelled_response && m_cancelled_response_id == response_id) {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                                          "(%s) processMessage - dropping delta from cancelled response %s\n",
+                                          m_sessionId.c_str(), response_id);
+                        cJSON_Delete(json);
+                        return SWITCH_TRUE; // handled: do not forward the stale base64 payload
+                    }
+                    m_has_cancelled_response = false;
+                    m_current_response_id = response_id;
                 }
 
-                // The audio payload was already decoded: strip the base64 from the copies used for
-                // events and logs (the README documents EVENT_PLAY as replacing it with the file path)
-                cJSON_DeleteItemFromObject(json, "delta");
+                const char *jsonAudio = cJSON_GetObjectCstr(json, "delta");
+                m_response_audio_done = false;
 
-                bool notify_play = false;
-                if (!m_disable_audiofiles) {
-                    std::string filePath = saveDebugAudioFile(rawAudio);
-                    if (!filePath.empty()) {
-                        cJSON *jsonFile = cJSON_CreateString(filePath.c_str());
-                        if (jsonFile) {
-                            cJSON_AddItemToObject(json, "file", jsonFile);
-                            notify_play = true;
+                if (jsonAudio && strlen(jsonAudio) > 0) {
+                    std::string rawAudio;
+                    try {
+                        rawAudio = base64_decode(jsonAudio);
+                    } catch (const std::exception& e) {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                          "(%s) processMessage - base64 decode error: %s\n", m_sessionId.c_str(),
+                                          e.what());
+                        cJSON_Delete(json);
+                        return status;
+                    }
+
+                    // The audio payload was already decoded: strip the base64 from the copies used for
+                    // events and logs (the README documents EVENT_PLAY as replacing it with the file path)
+                    cJSON_DeleteItemFromObject(json, "delta");
+
+                    bool notify_play = false;
+                    if (!m_disable_audiofiles) {
+                        std::string filePath = saveDebugAudioFile(rawAudio);
+                        if (!filePath.empty()) {
+                            cJSON *jsonFile = cJSON_CreateString(filePath.c_str());
+                            if (jsonFile) {
+                                cJSON_AddItemToObject(json, "file", jsonFile);
+                                notify_play = true;
+                            }
                         }
                     }
-                }
 
-                char *jsonString = cJSON_PrintUnformatted(json);
-                if (jsonString) {
-                    if (notify_play) {
-                        m_notify(session, EVENT_PLAY, jsonString);
+                    char *jsonString = cJSON_PrintUnformatted(json);
+                    if (jsonString) {
+                        if (notify_play) {
+                            m_notify(session, EVENT_PLAY, jsonString);
+                        }
+                        message.assign(jsonString);
+                        free(jsonString);
                     }
-                    message.assign(jsonString);
-                    free(jsonString);
-                }
 
-                auto resampled = convertRawAudio(rawAudio);
-                if (!resampled.empty()) {
-                    push_audio_queue(resampled);
-                    status = SWITCH_TRUE;
-                }
+                    auto resampled = convertRawAudio(rawAudio);
+                    if (!resampled.empty()) {
+                        push_audio_queue(resampled);
+                        status = SWITCH_TRUE;
+                    }
 
-            } else {
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                  "(%s) processMessage - response.output_audio.delta no audio data\n",
-                                  m_sessionId.c_str());
+                } else {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                      "(%s) processMessage - response.output_audio.delta no audio data\n",
+                                      m_sessionId.c_str());
+                }
+                break;
             }
-        } else if (jsType && strcmp(jsType, "response.output_audio.done") == 0) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-                              "(%s) processMessage - audio done\n", m_sessionId.c_str());
-            m_response_audio_done = true;
+
+            case JsonMessageType::AudioDone:
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                                  "(%s) processMessage - audio done\n", m_sessionId.c_str());
+                m_response_audio_done = true;
+                break;
+
+            case JsonMessageType::Unknown:
+                break;
         }
         cJSON_Delete(json);
         return status;
