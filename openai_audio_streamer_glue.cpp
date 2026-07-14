@@ -5,7 +5,6 @@
 #include <sstream>
 #include <queue>
 #include <algorithm>
-#include <cctype>
 #include <memory>
 #include <mutex>
 #include <atomic>
@@ -23,6 +22,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "stream_protocol.h"
+
 #define FRAME_SIZE_8000 320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
 #define MAX_AUDIO_CHUNK_SAMPLES                                                                                        \
     16384 /* max samples per queue entry (~32KB), keeps chunks within playback buffer capacity */
@@ -32,62 +33,6 @@
 #define MAX_JSON_DEPTH 128         /* guards the recursive cJSON parser against deeply nested peer JSON */
 #define MAX_STREAM_BUFFER_MS 1000  /* upper bound for the STREAM_BUFFER_SIZE capture aggregation window */
 #define MAX_HEARTBEAT_SECONDS 3600 /* upper bound for the STREAM_HEART_BEAT ping interval */
-
-// The bundled FreeSWITCH cJSON parser is recursive: deeply nested peer JSON can overflow the
-// stack (GHSA-2v74-pcgh-75wg). Scan the raw text and reject before parsing.
-static bool json_depth_exceeded(const char *s, int max_depth) {
-    int depth = 0;
-    bool in_string = false;
-    for (; *s; ++s) {
-        const char c = *s;
-        if (in_string) {
-            if (c == '\\' && s[1]) {
-                ++s;
-            } else if (c == '"') {
-                in_string = false;
-            }
-        } else if (c == '"') {
-            in_string = true;
-        } else if (c == '{' || c == '[') {
-            if (++depth > max_depth) {
-                return true;
-            }
-        } else if (c == '}' || c == ']') {
-            if (depth > 0) {
-                --depth;
-            }
-        }
-    }
-    return false;
-}
-
-enum class JsonMessageType {
-    Error,
-    SpeechStarted,
-    SpeechStopped,
-    AudioDelta,
-    AudioDone,
-    Unknown,
-};
-
-static JsonMessageType classify_json_message(const char *type) {
-    if (strstr(type, "error")) {
-        return JsonMessageType::Error;
-    }
-    if (strcmp(type, "input_audio_buffer.speech_started") == 0) {
-        return JsonMessageType::SpeechStarted;
-    }
-    if (strcmp(type, "input_audio_buffer.speech_stopped") == 0) {
-        return JsonMessageType::SpeechStopped;
-    }
-    if (strcmp(type, "response.output_audio.delta") == 0) {
-        return JsonMessageType::AudioDelta;
-    }
-    if (strcmp(type, "response.output_audio.done") == 0) {
-        return JsonMessageType::AudioDone;
-    }
-    return JsonMessageType::Unknown;
-}
 
 // Persistent buffers for stream_frame to avoid per-frame heap allocations
 struct StreamBuffers {
@@ -518,7 +463,7 @@ class AudioStreamer {
 
     switch_bool_t processMessage(switch_core_session_t *session, std::string& message) {
         switch_bool_t status = SWITCH_FALSE;
-        if (json_depth_exceeded(message.c_str(), MAX_JSON_DEPTH)) {
+        if (stream_protocol::json_depth_exceeded(message.c_str(), MAX_JSON_DEPTH)) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                               "(%s) processMessage - dropping JSON nested deeper than %d levels\n", m_sessionId.c_str(),
                               MAX_JSON_DEPTH);
@@ -540,13 +485,13 @@ class AudioStreamer {
             return status;
         }
 
-        switch (classify_json_message(jsType)) {
-            case JsonMessageType::Error:
+        switch (stream_protocol::classify_json_message(jsType)) {
+            case stream_protocol::JsonMessageType::Error:
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                                   "(%s) processMessage - error: %s\n", m_sessionId.c_str(), message.c_str());
                 break;
 
-            case JsonMessageType::SpeechStarted:
+            case stream_protocol::JsonMessageType::SpeechStarted:
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                                   "(%s) processMessage - user speech started, stopping openai audio playback\n",
                                   m_sessionId.c_str());
@@ -560,12 +505,12 @@ class AudioStreamer {
                 }
                 break;
 
-            case JsonMessageType::SpeechStopped:
+            case stream_protocol::JsonMessageType::SpeechStopped:
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                                   "(%s) processMessage - user speech stopped\n", m_sessionId.c_str());
                 break;
 
-            case JsonMessageType::AudioDelta: {
+            case stream_protocol::JsonMessageType::AudioDelta: {
                 // Drop late deltas belonging to a response interrupted by barge-in: they would
                 // otherwise be queued and replayed over the new response. A delta from a different
                 // response clears the cancelled state and is played normally.
@@ -636,13 +581,13 @@ class AudioStreamer {
                 break;
             }
 
-            case JsonMessageType::AudioDone:
+            case stream_protocol::JsonMessageType::AudioDone:
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
                                   "(%s) processMessage - audio done\n", m_sessionId.c_str());
                 m_response_audio_done = true;
                 break;
 
-            case JsonMessageType::Unknown:
+            case stream_protocol::JsonMessageType::Unhandled:
                 break;
         }
         cJSON_Delete(json);
@@ -1116,110 +1061,11 @@ void stream_session_lifecycle_unlock(void *handle) {
 }
 
 int validate_ws_uri(const char *url, char *wsUri) {
-    const char *hostStart = nullptr;
-    const char *hostEnd = nullptr;
-
-    // Check scheme
-    if (strncmp(url, "ws://", 5) == 0) {
-        hostStart = url + 5;
-    } else if (strncmp(url, "wss://", 6) == 0) {
-        hostStart = url + 6;
-    } else {
-        return 0;
-    }
-
-    if (*hostStart == '[') {
-        // Bracketed IPv6 literal
-        hostEnd = hostStart + 1;
-        while (*hostEnd && *hostEnd != ']') {
-            if (!std::isxdigit(static_cast<unsigned char>(*hostEnd)) && *hostEnd != ':' && *hostEnd != '.') {
-                return 0;
-            }
-            ++hostEnd;
-        }
-        if (*hostEnd != ']' || hostEnd == hostStart + 1) {
-            return 0;
-        }
-        ++hostEnd; // past ']'
-    } else {
-        // Hostname or IPv4: stop at port, path or query
-        hostEnd = hostStart;
-        while (*hostEnd && *hostEnd != ':' && *hostEnd != '/' && *hostEnd != '?') {
-            if (!std::isalnum(static_cast<unsigned char>(*hostEnd)) && *hostEnd != '-' && *hostEnd != '.') {
-                return 0;
-            }
-            ++hostEnd;
-        }
-        if (hostStart == hostEnd) {
-            return 0;
-        }
-    }
-
-    // Optional port: at least one digit, between 1 and 65535
-    if (*hostEnd == ':') {
-        const char *portStart = hostEnd + 1;
-        const char *p = portStart;
-        long port = 0;
-        while (*p && *p != '/' && *p != '?') {
-            if (!std::isdigit(static_cast<unsigned char>(*p))) {
-                return 0;
-            }
-            port = port * 10 + (*p - '0');
-            if (port > 65535) {
-                return 0;
-            }
-            ++p;
-        }
-        if (p == portStart || port == 0) {
-            return 0;
-        }
-        hostEnd = p;
-    }
-
-    // After the authority only end of string, a path or a query are valid
-    if (*hostEnd != '\0' && *hostEnd != '/' && *hostEnd != '?') {
-        return 0;
-    }
-
-    // Copy valid URI to wsUri
-    size_t len = strlen(url);
-    if (len >= MAX_WS_URI) {
-        return 0;
-    }
-    memcpy(wsUri, url, len + 1);
-    return 1;
+    return stream_protocol::validate_ws_uri(url, wsUri, MAX_WS_URI) ? 1 : 0;
 }
 
 switch_status_t is_valid_utf8(const char *str) {
-    switch_status_t status = SWITCH_STATUS_FALSE;
-    while (*str) {
-        if ((*str & 0x80) == 0x00) {
-            // 1-byte character
-            str++;
-        } else if ((*str & 0xE0) == 0xC0) {
-            // 2-byte character
-            if ((str[1] & 0xC0) != 0x80) {
-                return status;
-            }
-            str += 2;
-        } else if ((*str & 0xF0) == 0xE0) {
-            // 3-byte character
-            if ((str[1] & 0xC0) != 0x80 || (str[2] & 0xC0) != 0x80) {
-                return status;
-            }
-            str += 3;
-        } else if ((*str & 0xF8) == 0xF0) {
-            // 4-byte character
-            if ((str[1] & 0xC0) != 0x80 || (str[2] & 0xC0) != 0x80 || (str[3] & 0xC0) != 0x80) {
-                return status;
-            }
-            str += 4;
-        } else {
-            // invalid character
-            return status;
-        }
-    }
-    return SWITCH_STATUS_SUCCESS;
+    return stream_protocol::is_valid_utf8(str) ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
 }
 
 switch_status_t stream_session_send_json(switch_core_session_t *session, const char *base64_input) {

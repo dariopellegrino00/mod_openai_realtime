@@ -7,6 +7,11 @@ FROM debian:12 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+ARG LIBKS_REF=b756a6da9ccbc5ed92d1416d45cdb8b06a75d35b
+ARG SOFIA_SIP_REF=7333682a297f28130ff46d5ef0f9e2f72adca0e8
+ARG SPANDSP_REF=797760168945c96e91af55bde9d4edaea2e654f9
+ARG SIGNALWIRE_C_REF=d1d524c5a0fe3bd0b0023af69deab81401e75728
+ARG FREESWITCH_REF=ac9b8c621b3ac362ea1e153a929aaee6902a1b2d
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
 	ca-certificates git curl wget \
@@ -27,7 +32,12 @@ RUN git clone https://github.com/signalwire/libks && \
 	git clone https://github.com/freeswitch/sofia-sip && \
 	git clone https://github.com/freeswitch/spandsp && \
 	git clone https://github.com/signalwire/signalwire-c && \
-	git clone https://github.com/signalwire/freeswitch
+	git clone https://github.com/signalwire/freeswitch && \
+	git -C libks checkout "${LIBKS_REF}" && \
+	git -C sofia-sip checkout "${SOFIA_SIP_REF}" && \
+	git -C spandsp checkout "${SPANDSP_REF}" && \
+	git -C signalwire-c checkout "${SIGNALWIRE_C_REF}" && \
+	git -C freeswitch checkout "${FREESWITCH_REF}"
 
 # libks
 WORKDIR /src/libks
@@ -58,9 +68,39 @@ RUN ./bootstrap.sh -j && \
 	make -j"$(nproc)" && make install
 
 ############################
-# Stage 2: Slim SDK image (no FreeSWITCH runtime)
+# Integration test image: SDK + real FreeSWITCH runtime
 ############################
-FROM debian:12
+FROM builder AS integration-test
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+	python3 python3-websockets \
+	&& rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src/freeswitch
+RUN make samples && \
+	sed -i 's/<param name="listen-ip" value="::"\/>/<param name="listen-ip" value="127.0.0.1"\/>/' \
+	/usr/etc/freeswitch/autoload_configs/event_socket.conf.xml
+
+WORKDIR /work
+COPY . /work
+
+RUN cmake -S /work/tests -B /work/build/unit-sanitized \
+	-DCMAKE_BUILD_TYPE=Debug \
+	-DENABLE_TEST_SANITIZERS=ON && \
+	cmake --build /work/build/unit-sanitized -j"$(nproc)" && \
+	ctest --test-dir /work/build/unit-sanitized --output-on-failure && \
+	cmake -S /work -B /work/build/integration \
+	-DCMAKE_BUILD_TYPE=RelWithDebInfo && \
+	cmake --build /work/build/integration -j"$(nproc)" && \
+	cmake --install /work/build/integration && \
+	ldconfig
+
+ENTRYPOINT ["/work/tests/integration/run.sh"]
+
+############################
+# Slim SDK image (no FreeSWITCH runtime)
+############################
+FROM debian:12 AS sdk
 
 ENV DEBIAN_FRONTEND=noninteractive
 

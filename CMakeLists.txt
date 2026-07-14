@@ -39,6 +39,8 @@ add_library(mod_openai_audio_stream SHARED
     mod_openai_audio_stream.h
     openai_audio_streamer_glue.h
     openai_audio_streamer_glue.cpp
+    stream_protocol.cpp
+    stream_protocol.h
     base64.cpp
 )
 
