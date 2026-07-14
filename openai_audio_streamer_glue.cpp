@@ -41,15 +41,15 @@ class AudioStreamer {
                   bool suppressLog, const char *extra_headers, bool no_reconnect, const char *tls_cafile,
                   const char *tls_keyfile, const char *tls_certfile, bool tls_disable_hostname_validation,
                   uint32_t session_sampling, uint32_t playback_sampling, bool disable_audiofiles, bool raw_audio_mode)
-        : m_sessionId(uuid), m_notify(callback), m_suppress_log(suppressLog), m_extra_headers(extra_headers),
-          m_playFile(0), m_disable_audiofiles(disable_audiofiles), m_raw_audio_mode(raw_audio_mode) {
+        : m_sessionId(uuid), m_notify(callback), m_suppress_log(suppressLog), m_playFile(0),
+          m_disable_audiofiles(disable_audiofiles), m_raw_audio_mode(raw_audio_mode) {
 
         in_sample_rate = playback_sampling;
 
         ix::WebSocketHttpHeaders headers;
         ix::SocketTLSOptions tlsOptions;
-        if (m_extra_headers) {
-            cJSON *headers_json = cJSON_Parse(m_extra_headers);
+        if (extra_headers) {
+            cJSON *headers_json = cJSON_Parse(extra_headers);
             if (headers_json) {
                 cJSON *iterator = headers_json->child;
                 while (iterator) {
@@ -474,7 +474,7 @@ class AudioStreamer {
         return (webSocket.getReadyState() == ix::ReadyState::Open);
     }
 
-    void writeAudioDelta(uint8_t *buffer, size_t len) {
+    void writeAudioDelta(const uint8_t *buffer, size_t len) {
         if (!this->isConnected())
             return;
         // Convert the buffer to PCM16 and then base64 encode it.
@@ -494,13 +494,13 @@ class AudioStreamer {
         switch_safe_free(jsonStr);
     }
 
-    void writeBinary(uint8_t *buffer, size_t len) {
+    void writeBinary(const uint8_t *buffer, size_t len) {
         if (!this->isConnected())
             return;
         webSocket.sendBinary(ix::IXWebSocketSendData(reinterpret_cast<const char *>(buffer), len));
     }
 
-    void sendAudio(uint8_t *buffer, size_t len) {
+    void sendAudio(const uint8_t *buffer, size_t len) {
         if (m_raw_audio_mode) {
             writeBinary(buffer, len);
         } else {
@@ -508,10 +508,10 @@ class AudioStreamer {
         }
     }
 
-    void writeText(const char *text) { // Openai only accepts json not utf8 plain text
+    bool writeText(const char *text) { // Openai only accepts json not utf8 plain text
         if (!this->isConnected())
-            return;
-        webSocket.sendUtf8Text(ix::IXWebSocketSendData(text, strlen(text)));
+            return false;
+        return webSocket.sendUtf8Text(ix::IXWebSocketSendData(text, strlen(text))).success;
     }
 
     void deleteFiles() {
@@ -571,7 +571,6 @@ class AudioStreamer {
     responseHandler_t m_notify;
     ix::WebSocket webSocket;
     bool m_suppress_log;
-    const char *m_extra_headers;
     int m_playFile;
     std::unordered_set<std::string> m_Files;
 
@@ -835,8 +834,7 @@ switch_status_t stream_session_send_json(switch_core_session_t *session, const c
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
                       "stream_session_send_json: sending JSON: %s\n", json_unformatted);
-    pAudioStreamer->writeText(json_unformatted);
-    status = SWITCH_STATUS_SUCCESS;
+    status = pAudioStreamer->writeText(json_unformatted) ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
 
     if (json_unformatted)
         free(json_unformatted);
@@ -967,6 +965,7 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
     bool tls_disable_hostname_validation = false;
     bool disable_audiofiles = false;
     bool raw_audio_mode = force_raw_audio_mode ? true : false;
+    std::string authorization_header_json;
 
     switch_channel_t *channel = switch_core_session_get_channel(session);
 
@@ -1035,9 +1034,8 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
     }
 
     if (openai_api_key) {
-        char headers_buf[1024] = {0};
-        snprintf(headers_buf, sizeof(headers_buf), "{\"Authorization\": \"Bearer %s\"}", openai_api_key);
-        extra_headers = headers_buf;
+        authorization_header_json = "{\"Authorization\": \"Bearer " + std::string(openai_api_key) + "\"}";
+        extra_headers = authorization_header_json.c_str();
     } else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
                           "OPENAI_API_KEY is not set. Assuming you set STREAM_EXTRA_HEADERS variable.\n");
@@ -1084,7 +1082,7 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
     // Get persistent buffers (allocated once per session, reused across all frames)
     auto *bufs = static_cast<StreamBuffers *>(tech_pvt->stream_buffers);
 
-    auto flush_sbuffer = [&]() {
+    auto flush_sbuffer = [tech_pvt, pAudioStreamer, bufs]() {
         switch_size_t inuse = switch_buffer_inuse(tech_pvt->sbuffer);
         if (inuse > 0) {
             bufs->flush_buffer.resize(inuse);
@@ -1092,6 +1090,41 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
             switch_buffer_zero(tech_pvt->sbuffer);
             pAudioStreamer->sendAudio(bufs->flush_buffer.data(), inuse);
         }
+    };
+
+    auto send_or_buffer_audio = [tech_pvt, pAudioStreamer, &flush_sbuffer](const uint8_t *data, size_t length) {
+        if (tech_pvt->rtp_packets == 1) {
+            pAudioStreamer->sendAudio(data, length);
+            return true;
+        }
+
+        while (length > 0) {
+            switch_size_t free_space = switch_buffer_freespace(tech_pvt->sbuffer);
+            if (free_space == 0) {
+                flush_sbuffer();
+                free_space = switch_buffer_freespace(tech_pvt->sbuffer);
+                if (free_space == 0) {
+                    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                                      "%s: Audio buffer has no free space after flush\n", tech_pvt->sessionId);
+                    return false;
+                }
+            }
+
+            switch_size_t write_len = std::min<switch_size_t>(length, free_space);
+            if (switch_buffer_write(tech_pvt->sbuffer, data, write_len) == 0) {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "%s: Failed to write audio to stream buffer\n",
+                                  tech_pvt->sessionId);
+                return false;
+            }
+
+            data += write_len;
+            length -= write_len;
+            if (switch_buffer_freespace(tech_pvt->sbuffer) == 0) {
+                flush_sbuffer();
+            }
+        }
+
+        return true;
     };
 
     switch_frame_t frame{};
@@ -1105,80 +1138,62 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
         }
 
         if (!tech_pvt->resampler) {
-            if (tech_pvt->rtp_packets == 1) {
-                pAudioStreamer->sendAudio(static_cast<uint8_t *>(frame.data), frame.datalen);
-            } else {
-                size_t write_len = frame.datalen;
-                const uint8_t *write_data = static_cast<const uint8_t *>(frame.data);
-                switch_size_t free_space = switch_buffer_freespace(tech_pvt->sbuffer);
-                if (write_len > free_space) {
-                    flush_sbuffer();
-                    free_space = switch_buffer_freespace(tech_pvt->sbuffer);
-                }
-                // Only write if buffer has enough space
-                if (write_len <= free_space) {
-                    switch_buffer_write(tech_pvt->sbuffer, write_data, write_len);
-                    if (switch_buffer_freespace(tech_pvt->sbuffer) == 0) {
-                        flush_sbuffer();
-                    }
-                } else {
-                    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                                      "%s: Dropping %zu bytes of audio data, buffer capacity exceeded\n",
-                                      tech_pvt->sessionId, write_len);
-                }
+            if (!send_or_buffer_audio(static_cast<const uint8_t *>(frame.data), frame.datalen)) {
+                break;
             }
             continue;
         }
 
-        size_t available = switch_buffer_freespace(tech_pvt->sbuffer);
-        spx_uint32_t in_len = frame.samples;
-        spx_uint32_t out_len = available / (tech_pvt->channels * sizeof(spx_int16_t));
-        if (out_len == 0) {
-            flush_sbuffer();
-            available = switch_buffer_freespace(tech_pvt->sbuffer);
-            out_len = available / (tech_pvt->channels * sizeof(spx_int16_t));
-            // Skip processing if buffer still has no space after flushing
-            if (out_len == 0) {
-                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                                  "%s: Buffer full, cannot process resampled frame\n", tech_pvt->sessionId);
-                continue;
-            }
+        spx_uint32_t input_rate = 0;
+        spx_uint32_t output_rate = 0;
+        speex_resampler_get_rate(tech_pvt->resampler, &input_rate, &output_rate);
+        if (input_rate == 0 || output_rate == 0) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "%s: Invalid resampler rate %u -> %u\n",
+                              tech_pvt->sessionId, input_rate, output_rate);
+            continue;
         }
 
-        bufs->resample_buffer.resize(out_len * tech_pvt->channels);
+        const uint64_t estimated_output =
+            (static_cast<uint64_t>(frame.samples) * output_rate + input_rate - 1) / input_rate;
+        const spx_uint32_t output_capacity = static_cast<spx_uint32_t>(estimated_output + 1);
+        bufs->resample_buffer.resize(static_cast<size_t>(output_capacity) * tech_pvt->channels);
 
-        if (tech_pvt->channels == 1) {
-            speex_resampler_process_int(tech_pvt->resampler, 0, static_cast<const spx_int16_t *>(frame.data), &in_len,
-                                        bufs->resample_buffer.data(), &out_len);
-        } else {
-            speex_resampler_process_interleaved_int(tech_pvt->resampler, static_cast<const spx_int16_t *>(frame.data),
-                                                    &in_len, bufs->resample_buffer.data(), &out_len);
-        }
+        const auto *input = static_cast<const spx_int16_t *>(frame.data);
+        spx_uint32_t remaining_samples = frame.samples;
+        while (remaining_samples > 0) {
+            spx_uint32_t in_len = remaining_samples;
+            spx_uint32_t out_len = output_capacity;
+            int result;
 
-        size_t bytes_written = out_len * tech_pvt->channels * sizeof(spx_int16_t);
-        if (bytes_written > 0) {
-            // For 20ms packets, send immediately without buffering
-            if (tech_pvt->rtp_packets == 1) {
-                pAudioStreamer->sendAudio(reinterpret_cast<uint8_t *>(bufs->resample_buffer.data()), bytes_written);
+            if (tech_pvt->channels == 1) {
+                result = speex_resampler_process_int(tech_pvt->resampler, 0, input, &in_len,
+                                                     bufs->resample_buffer.data(), &out_len);
             } else {
-                // Check if buffer has enough space before writing
-                switch_size_t free_space = switch_buffer_freespace(tech_pvt->sbuffer);
-                if (bytes_written > free_space) {
-                    flush_sbuffer();
-                    free_space = switch_buffer_freespace(tech_pvt->sbuffer);
-                }
-                if (bytes_written <= free_space) {
-                    switch_buffer_write(tech_pvt->sbuffer,
-                                        reinterpret_cast<const uint8_t *>(bufs->resample_buffer.data()), bytes_written);
-                    if (switch_buffer_freespace(tech_pvt->sbuffer) == 0) {
-                        flush_sbuffer();
-                    }
-                } else {
-                    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                                      "%s: Dropping %zu bytes of resampled audio data, buffer capacity exceeded\n",
-                                      tech_pvt->sessionId, bytes_written);
-                }
+                result = speex_resampler_process_interleaved_int(tech_pvt->resampler, input, &in_len,
+                                                                 bufs->resample_buffer.data(), &out_len);
             }
+
+            if (result != RESAMPLER_ERR_SUCCESS) {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "%s: Resampling failed: %s\n",
+                                  tech_pvt->sessionId, speex_resampler_strerror(result));
+                break;
+            }
+
+            size_t bytes_written = static_cast<size_t>(out_len) * tech_pvt->channels * sizeof(spx_int16_t);
+            if (bytes_written > 0 &&
+                !send_or_buffer_audio(reinterpret_cast<const uint8_t *>(bufs->resample_buffer.data()), bytes_written)) {
+                break;
+            }
+
+            if (in_len == 0 && out_len == 0) {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                                  "%s: Resampler made no progress with %u input samples remaining\n",
+                                  tech_pvt->sessionId, remaining_samples);
+                break;
+            }
+
+            input += static_cast<size_t>(in_len) * tech_pvt->channels;
+            remaining_samples -= in_len;
         }
     }
 
@@ -1268,6 +1283,7 @@ switch_status_t stream_session_cleanup(switch_core_session_t *session, char *tex
     auto *bug = static_cast<switch_media_bug_t *>(switch_channel_get_private(channel, MY_BUG_NAME));
     if (bug) {
         auto *tech_pvt = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
+        switch_status_t status = SWITCH_STATUS_SUCCESS;
         char sessionId[MAX_SESSION_ID];
 
         strncpy(sessionId, tech_pvt->sessionId, MAX_SESSION_ID - 1);
@@ -1277,6 +1293,10 @@ switch_status_t stream_session_cleanup(switch_core_session_t *session, char *tex
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_session_cleanup\n",
                           sessionId);
 
+        if (text && *text) {
+            status = stream_session_send_json(session, text);
+        }
+
         switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
         if (!channelIsClosing) {
             switch_core_media_bug_remove(session, &bug);
@@ -1285,9 +1305,6 @@ switch_status_t stream_session_cleanup(switch_core_session_t *session, char *tex
         auto *audioStreamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
         if (audioStreamer) {
             audioStreamer->deleteFiles();
-            if (text && *text) {
-                stream_session_send_json(session, text);
-            }
             finish(tech_pvt);
         }
 
@@ -1296,7 +1313,7 @@ switch_status_t stream_session_cleanup(switch_core_session_t *session, char *tex
 
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                           "(%s) stream_session_cleanup: connection closed\n", sessionId);
-        return SWITCH_STATUS_SUCCESS;
+        return status;
     }
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
