@@ -97,10 +97,10 @@ The following channel variables can be used to fine-tune websocket connection an
 | Variable                               | Description                                             | Default |
 | -------------------------------------- | ------------------------------------------------------- | ------- |
 | STREAM_MESSAGE_DEFLATE                 | true or 1, disables per message deflate                 | off     |
-| STREAM_HEART_BEAT                      | number of seconds, interval to send the heart beat      | off     |
+| STREAM_HEART_BEAT                      | number of seconds (1 to 3600), interval to send the heart beat | off     |
 | STREAM_SUPPRESS_LOG                    | true or 1, suppresses printing to log                   | off     |
-| STREAM_BUFFER_SIZE                     | buffer duration in milliseconds, divisible by 20        | 20      |
-| STREAM_EXTRA_HEADERS                   | JSON object for additional headers in string format     | none    |
+| STREAM_BUFFER_SIZE                     | buffer duration in milliseconds, divisible by 20, max 1000 | 20      |
+| STREAM_EXTRA_HEADERS                   | JSON object for additional headers in string format; merged with the Authorization header when STREAM_OPENAI_API_KEY is set (Authorization takes precedence) | none    |
 | STREAM_NO_RECONNECT                    | true or 1, disables automatic websocket reconnection; when the connection closes, pending audio is played out and the stream stops | off     |
 | STREAM_TLS_CA_FILE                     | CA cert or bundle, or the special values SYSTEM or NONE | SYSTEM  |
 | STREAM_TLS_KEY_FILE                    | optional client key for WSS connections                 | none    |
@@ -208,12 +208,12 @@ Attaches a media bug and starts streaming audio (in L16 format) to the websocket
   - "8k" = 8000 Hz
   - "16k" = 16000 Hz
   - "24k" = 24000 Hz (default)
-  - or any multiple of 8000
+  - or any multiple of 8000 up to 48000
 - `playback-rate` - optional, the sample rate at which audio arrives from the server. The module resamples from this rate to the channel codec rate for playback. Choice of
   - "8k" = 8000 Hz
   - "16k" = 16000 Hz
   - "24k" = 24000 Hz (default)
-  - or any multiple of 8000
+  - or any multiple of 8000 up to 48000
   - If omitted, defaults to 24000 (OpenAI Realtime API rate). When using raw audio mode with a custom backend that sends audio at a different rate, set this to match the source audio rate.
 - `mute_user` - optional flag. When present, the module initialises muted and ignores caller audio until an explicit `unmute`.
 - **IMPORTANT NOTE**: The OpenAI Realtime API, when using PCM audio format, expects the audio to be in 24 kHz sample rate. The module now defaults `send-rate` to `24k` for this reason, and mono remains the recommended mode for OpenAI Realtime. You can still override `send-rate` explicitly if you are targeting a different backend. From the OpenAI Realtime API documentation: *input audio must be 16-bit PCM at a 24kHz sample rate, single channel (mono), and little-endian byte order.* When using raw audio mode with a custom backend, the `playback-rate` parameter lets you specify the rate of audio sent back for playback, avoiding pitch/speed distortion from incorrect resampling.

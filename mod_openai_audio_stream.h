@@ -8,6 +8,8 @@
 #define MY_BUG_NAME "audio_stream"
 #define MAX_SESSION_ID (256)
 #define MAX_WS_URI (4096)
+#define STREAM_MIN_SAMPLING (8000)
+#define STREAM_MAX_SAMPLING (48000)
 
 #define EVENT_CONNECT "mod_openai_audio_stream::connect"
 #define EVENT_DISCONNECT "mod_openai_audio_stream::disconnect"
