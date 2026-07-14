@@ -25,16 +25,13 @@ struct private_data {
     switch_mutex_t *mutex;
     char sessionId[MAX_SESSION_ID];
     SpeexResamplerState *resampler;
-    responseHandler_t responseHandler;
     void *pAudioStreamer;
-    char ws_uri[MAX_WS_URI];
     int sampling;
     int channels;
     switch_atomic_t audio_paused;
     switch_atomic_t user_audio_muted;
     switch_atomic_t openai_audio_muted;
     switch_atomic_t close_requested;
-    int raw_audio_mode : 1;
     switch_buffer_t *sbuffer;
     int rtp_packets;
     switch_buffer_t *playback_buffer;

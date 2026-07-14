@@ -59,7 +59,7 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make
 sudo make install
 ```
-**TLS** is `OFF` by default. To build with TLS support add `-DUSE_TLS=ON` to cmake line.
+**TLS** support is enabled by the current CMake configuration.
 
 ### Getting started
 
@@ -124,6 +124,7 @@ you would set this variable to 100. If ommited, default packet size of 20ms will
       "Header2": "Value2",
       "Header3": "Value3"
   }
+  ```
 - Websocket automatic reconnection is on by default. To disable it set this channel variable to true or 1.
 - TLS (for WSS) options can be fine tuned with the `STREAM_TLS_*` channel variables:
   - `STREAM_TLS_CA_FILE` the ca certificate (or certificate bundle) file. By default is `SYSTEM` which means use the system defaults.
@@ -227,13 +228,15 @@ Uses the same arguments as `uuid_openai_audio_stream ... start ...`, but forces 
 All lifecycle commands (`stop`, `pause`, `resume`, `mute`, `unmute`, and `send_json`) are available on both `uuid_openai_audio_stream` and `uuid_raw_audio_stream`, because `uuid_raw_audio_stream` only changes how `start` selects raw audio mode and does not create a separate control plane. For clarity and consistency, prefer controlling the stream through the same API family used for `start`.
 
 ```
-uuid_openai_audio_stream <uuid> send_json
+uuid_openai_audio_stream <uuid> send_json <base64json>
 ```
 Sends a json object **base64 encoded** to the OpenAI websocket endpoint. Requires a valid `base64` text and a valid json compliant to the OpenAI Realtime API specification. The reason for base64 encoding is that spaces, new lines and other special characters in the json object can cause issues with the freeswitch API command parsing.
 
 ```
-uuid_openai_audio_stream <uuid> stop 
+uuid_openai_audio_stream <uuid> stop [<base64json>]
 ```
+Stops the stream. When the optional base64-encoded JSON payload is present, the module validates and sends it before
+closing the WebSocket connection.
 
 ```
 uuid_openai_audio_stream <uuid> pause

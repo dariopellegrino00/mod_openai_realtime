@@ -1,6 +1,6 @@
 #include <string>
 #include <cstring>
-#include "mod_openai_audio_stream.h"
+#include "openai_audio_streamer_glue.h"
 #include <ixwebsocket/IXWebSocket.h>
 #include <sstream>
 #include <queue>
@@ -926,17 +926,13 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
 
     strncpy(tech_pvt->sessionId, switch_core_session_get_uuid(session), MAX_SESSION_ID - 1);
     tech_pvt->sessionId[MAX_SESSION_ID - 1] = '\0';
-    strncpy(tech_pvt->ws_uri, wsUri, MAX_WS_URI - 1);
-    tech_pvt->ws_uri[MAX_WS_URI - 1] = '\0';
     tech_pvt->sampling = desiredSampling;
-    tech_pvt->responseHandler = responseHandler;
     tech_pvt->rtp_packets = rtp_packets;
     tech_pvt->channels = channels;
     switch_atomic_set(&tech_pvt->audio_paused, 0);
     switch_atomic_set(&tech_pvt->user_audio_muted, start_muted ? 1 : 0);
     switch_atomic_set(&tech_pvt->openai_audio_muted, 0);
     switch_atomic_set(&tech_pvt->close_requested, 0);
-    tech_pvt->raw_audio_mode = raw_audio_mode ? 1 : 0;
 
     const size_t buflen = static_cast<size_t>(FRAME_SIZE_8000) * desiredSampling / 8000 * channels * rtp_packets;
     const size_t playback_buflen = 128000; // 128KB may need to be decreased
