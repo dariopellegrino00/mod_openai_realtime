@@ -101,7 +101,7 @@ The following channel variables can be used to fine-tune websocket connection an
 | STREAM_SUPPRESS_LOG                    | true or 1, suppresses printing to log                   | off     |
 | STREAM_BUFFER_SIZE                     | buffer duration in milliseconds, divisible by 20        | 20      |
 | STREAM_EXTRA_HEADERS                   | JSON object for additional headers in string format     | none    |
-| STREAM_NO_RECONNECT                    | true or 1, disables automatic websocket reconnection    | off     |
+| STREAM_NO_RECONNECT                    | true or 1, disables automatic websocket reconnection; when the connection closes, pending audio is played out and the stream stops | off     |
 | STREAM_TLS_CA_FILE                     | CA cert or bundle, or the special values SYSTEM or NONE | SYSTEM  |
 | STREAM_TLS_KEY_FILE                    | optional client key for WSS connections                 | none    |
 | STREAM_TLS_CERT_FILE                   | optional client cert for WSS connections                | none    |
