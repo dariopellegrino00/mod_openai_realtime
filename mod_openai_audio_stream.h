@@ -28,10 +28,10 @@ struct private_data {
     char ws_uri[MAX_WS_URI];
     int sampling;
     int channels;
-    int audio_paused : 1;
-    int user_audio_muted : 1;
-    int openai_audio_muted : 1;
-    int close_requested : 1;
+    switch_atomic_t audio_paused;
+    switch_atomic_t user_audio_muted;
+    switch_atomic_t openai_audio_muted;
+    switch_atomic_t close_requested;
     int raw_audio_mode : 1;
     switch_buffer_t *sbuffer;
     int rtp_packets;

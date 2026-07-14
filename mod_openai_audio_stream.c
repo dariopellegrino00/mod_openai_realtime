@@ -33,20 +33,17 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
 
         case SWITCH_ABC_TYPE_CLOSE: {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Got SWITCH_ABC_TYPE_CLOSE.\n");
-
-            // Check if this is a normal channel closure or a requested closure
-            int channelIsClosing = tech_pvt->close_requested ? 0 : 1;
-            stream_session_cleanup(session, NULL, channelIsClosing);
+            stream_session_cleanup(session, NULL, 1);
         } break;
 
         case SWITCH_ABC_TYPE_READ:
-            if (tech_pvt->close_requested) {
+            if (switch_atomic_read(&tech_pvt->close_requested)) {
                 return SWITCH_FALSE;
             }
             return stream_frame(bug);
             break;
         case SWITCH_ABC_TYPE_WRITE_REPLACE: // This is where the mediabug will write audio data to the channel
-            if (tech_pvt->close_requested) {
+            if (switch_atomic_read(&tech_pvt->close_requested)) {
                 return SWITCH_FALSE;
             }
             write_frame(session, bug);
@@ -109,6 +106,8 @@ static switch_status_t start_capture(switch_core_session_t *session, switch_medi
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "adding bug.\n");
     if ((status = switch_core_media_bug_add(session, MY_BUG_NAME, NULL, capture_callback, pUserData, 0, flags, &bug)) !=
         SWITCH_STATUS_SUCCESS) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error adding media bug.\n");
+        stream_session_release(pUserData);
         return status;
     }
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "setting bug private data.\n");

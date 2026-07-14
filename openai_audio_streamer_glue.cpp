@@ -9,6 +9,8 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <atomic>
+#include <cstdint>
 #include <vector>
 
 #include <switch_json.h>
@@ -109,7 +111,6 @@ class AudioStreamer {
                         }
                         auto converted = convertRawAudio(msg->str);
                         if (!converted.empty()) {
-                            playback_clear_requested = false;
                             m_response_audio_done = false;
                             push_audio_queue(converted);
                         }
@@ -192,12 +193,11 @@ class AudioStreamer {
         return bug;
     }
 
-    inline void media_bug_close(switch_core_session_t *session) {
+    inline void request_media_bug_close(switch_core_session_t *session) {
         auto *bug = get_media_bug(session);
         if (bug) {
             auto *tech_pvt = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
-            tech_pvt->close_requested = 1;
-            switch_core_media_bug_close(&bug, SWITCH_FALSE);
+            switch_atomic_set(&tech_pvt->close_requested, 1);
         }
     }
 
@@ -216,7 +216,9 @@ class AudioStreamer {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO, "connection error\n");
                     m_notify(psession, EVENT_ERROR, message);
 
-                    media_bug_close(psession);
+                    if (!webSocket.isAutomaticReconnectionEnabled()) {
+                        request_media_bug_close(psession);
+                    }
 
                     break;
                 case MESSAGE:
@@ -368,16 +370,14 @@ class AudioStreamer {
                               m_sessionId.c_str());
             clear_audio_queue();
             // also clear the private_t playback buffer used in write frame
-            playback_clear_requested = true;
+            request_playback_clear();
 
         } else if (jsType && strcmp(jsType, "input_audio_buffer.speech_stopped") == 0) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                               "(%s) processMessage - user speech stopped\n", m_sessionId.c_str());
-            // Do not clear playback_clear_requested here; it should remain true until new audio is received.
 
         } else if (jsType && strcmp(jsType, "response.output_audio.delta") == 0) {
             const char *jsonAudio = cJSON_GetObjectCstr(json, "delta");
-            playback_clear_requested = false;
             m_response_audio_done = false;
 
             if (jsonAudio && strlen(jsonAudio) > 0) {
@@ -522,8 +522,18 @@ class AudioStreamer {
         }
     }
 
-    bool clear_requested() {
-        return playback_clear_requested;
+    void request_playback_clear() {
+        m_playback_clear_gen.fetch_add(1, std::memory_order_release);
+    }
+
+    // Returns true once per pending clear request; media (write_frame) thread only
+    bool consume_playback_clear() {
+        const uint64_t gen = m_playback_clear_gen.load(std::memory_order_acquire);
+        if (gen == m_playback_clear_gen_seen) {
+            return false;
+        }
+        m_playback_clear_gen_seen = gen;
+        return true;
     }
 
     bool is_openai_speaking() {
@@ -579,10 +589,11 @@ class AudioStreamer {
     SpeexResamplerState *m_resampler = nullptr;
     std::queue<std::vector<int16_t>> m_audio_queue;
     std::mutex m_audio_queue_mutex;
-    bool playback_clear_requested = false;
-    bool m_disable_audiofiles = false; // disable saving audio files if true
-    bool m_openai_speaking = false;
-    bool m_response_audio_done = false;
+    std::atomic<uint64_t> m_playback_clear_gen{0};
+    uint64_t m_playback_clear_gen_seen = 0; // media (write_frame) thread only
+    bool m_disable_audiofiles = false;      // disable saving audio files if true
+    bool m_openai_speaking = false;         // media (write_frame) thread only
+    std::atomic<bool> m_response_audio_done{false};
     bool m_raw_audio_mode = false;
 };
 
@@ -609,9 +620,10 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
     tech_pvt->responseHandler = responseHandler;
     tech_pvt->rtp_packets = rtp_packets;
     tech_pvt->channels = channels;
-    tech_pvt->audio_paused = 0;
-    tech_pvt->user_audio_muted = start_muted ? 1 : 0;
-    tech_pvt->openai_audio_muted = 0;
+    switch_atomic_set(&tech_pvt->audio_paused, 0);
+    switch_atomic_set(&tech_pvt->user_audio_muted, start_muted ? 1 : 0);
+    switch_atomic_set(&tech_pvt->openai_audio_muted, 0);
+    switch_atomic_set(&tech_pvt->close_requested, 0);
     tech_pvt->raw_audio_mode = raw_audio_mode ? 1 : 0;
 
     const size_t buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * rtp_packets);
@@ -661,6 +673,13 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
 
 void destroy_tech_pvt(private_t *tech_pvt) {
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "%s destroy_tech_pvt\n", tech_pvt->sessionId);
+    if (tech_pvt->pAudioStreamer) {
+        auto *as = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
+        // Stop and join the WebSocket thread before destroying state its callbacks may use
+        as->disconnect();
+        delete as;
+        tech_pvt->pAudioStreamer = nullptr;
+    }
     if (tech_pvt->resampler) {
         speex_resampler_destroy(tech_pvt->resampler);
         tech_pvt->resampler = nullptr;
@@ -668,11 +687,6 @@ void destroy_tech_pvt(private_t *tech_pvt) {
     if (tech_pvt->mutex) {
         switch_mutex_destroy(tech_pvt->mutex);
         tech_pvt->mutex = nullptr;
-    }
-    if (tech_pvt->pAudioStreamer) {
-        auto *as = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
-        delete as;
-        tech_pvt->pAudioStreamer = nullptr;
     }
     if (tech_pvt->stream_buffers) {
         auto *sb = static_cast<StreamBuffers *>(tech_pvt->stream_buffers);
@@ -686,7 +700,11 @@ void finish(private_t *tech_pvt) {
     aStreamer.reset(static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer));
     tech_pvt->pAudioStreamer = nullptr;
 
-    std::thread t([aStreamer] { aStreamer->disconnect(); });
+    std::thread t([aStreamer] {
+        // stop and join the WebSocket thread first, so no callback can create files concurrently
+        aStreamer->disconnect();
+        aStreamer->deleteFiles();
+    });
     t.detach();
 }
 
@@ -857,7 +875,7 @@ switch_status_t stream_session_pauseresume(switch_core_session_t *session, int p
         return SWITCH_STATUS_FALSE;
 
     switch_core_media_bug_flush(bug);
-    tech_pvt->audio_paused = pause;
+    switch_atomic_set(&tech_pvt->audio_paused, pause ? 1 : 0);
     return SWITCH_STATUS_SUCCESS;
 }
 
@@ -877,18 +895,19 @@ switch_status_t stream_session_set_user_mute(switch_core_session_t *session, int
 
     status = SWITCH_STATUS_SUCCESS;
     switch_core_media_bug_flush(bug);
-    const int last_state = tech_pvt->user_audio_muted;
-    tech_pvt->user_audio_muted = mute ? 1 : 0;
-    if (last_state == tech_pvt->user_audio_muted) {
+    const uint32_t new_state = mute ? 1 : 0;
+    const uint32_t last_state = switch_atomic_read(&tech_pvt->user_audio_muted);
+    switch_atomic_set(&tech_pvt->user_audio_muted, new_state);
+    if (last_state == new_state) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "User audio is already %s\n",
-                          tech_pvt->user_audio_muted ? "muted" : "unmuted");
+                          new_state ? "muted" : "unmuted");
         return status;
     }
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "User audio %s\n",
-                      tech_pvt->user_audio_muted ? "muted" : "unmuted");
+                      new_state ? "muted" : "unmuted");
 
-    if (tech_pvt->user_audio_muted) {
+    if (new_state) {
         if (tech_pvt->mutex) {
             switch_mutex_lock(tech_pvt->mutex);
         }
@@ -935,14 +954,15 @@ switch_status_t stream_session_set_openai_mute(switch_core_session_t *session, i
     }
 
     switch_core_media_bug_flush(bug);
-    auto last_state = tech_pvt->openai_audio_muted;
-    tech_pvt->openai_audio_muted = mute ? 1 : 0;
-    if (last_state == tech_pvt->openai_audio_muted) {
+    const uint32_t new_state = mute ? 1 : 0;
+    const uint32_t last_state = switch_atomic_read(&tech_pvt->openai_audio_muted);
+    switch_atomic_set(&tech_pvt->openai_audio_muted, new_state);
+    if (last_state == new_state) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "OpenAI audio is already %s\n",
-                          tech_pvt->openai_audio_muted ? "muted" : "unmuted");
+                          new_state ? "muted" : "unmuted");
     } else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "OpenAI audio %s\n",
-                          tech_pvt->openai_audio_muted ? "muted" : "unmuted");
+                          new_state ? "muted" : "unmuted");
     }
 
     return SWITCH_STATUS_SUCCESS;
@@ -1063,9 +1083,15 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
     return SWITCH_STATUS_SUCCESS;
 }
 
+void stream_session_release(void *pUserData) {
+    if (pUserData) {
+        destroy_tech_pvt(static_cast<private_t *>(pUserData));
+    }
+}
+
 switch_bool_t stream_frame(switch_media_bug_t *bug) {
     auto *tech_pvt = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
-    if (!tech_pvt || tech_pvt->audio_paused || tech_pvt->user_audio_muted)
+    if (!tech_pvt || switch_atomic_read(&tech_pvt->audio_paused) || switch_atomic_read(&tech_pvt->user_audio_muted))
         return SWITCH_TRUE;
 
     if (switch_mutex_trylock(tech_pvt->mutex) != SWITCH_STATUS_SUCCESS) {
@@ -1203,7 +1229,7 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
 
 switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bug) {
     private_t *tech_pvt = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
-    if (!tech_pvt || tech_pvt->audio_paused) {
+    if (!tech_pvt || switch_atomic_read(&tech_pvt->audio_paused)) {
         return SWITCH_TRUE;
     }
 
@@ -1233,9 +1259,13 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
     uint32_t inuse = switch_buffer_inuse(tech_pvt->playback_buffer);
 
     // push a chunk in the audio buffer used treated as cache
-    if (as->clear_requested()) {
+    if (as->consume_playback_clear()) {
         switch_buffer_zero(tech_pvt->playback_buffer);
         inuse = 0;
+        // barge-in interrupts the response: close the speaking state so the next one emits a new start
+        if (as->is_openai_speaking()) {
+            as->openai_speech_stopped();
+        }
     }
     bool chunk_enqueued = false;
     if (inuse < bytes_needed * 2) {
@@ -1258,7 +1288,7 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
         inuse = bytes_needed;
     }
 
-    if (tech_pvt->openai_audio_muted) {
+    if (switch_atomic_read(&tech_pvt->openai_audio_muted)) {
         switch_buffer_toss(tech_pvt->playback_buffer, inuse);
     } else {
         switch_byte_t *data = static_cast<switch_byte_t *>(frame->data);
@@ -1304,7 +1334,6 @@ switch_status_t stream_session_cleanup(switch_core_session_t *session, char *tex
 
         auto *audioStreamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
         if (audioStreamer) {
-            audioStreamer->deleteFiles();
             finish(tech_pvt);
         }
 

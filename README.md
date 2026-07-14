@@ -155,7 +155,7 @@ Because text frames continue to be processed through the normal `processMessage(
 
 | Feature | Required text event from backend | Effect |
 | --- | --- | --- |
-| Barge-in (user interrupts playback) | `{"type":"input_audio_buffer.speech_started"}` | Clears audio queue and playback buffer |
+| Barge-in (user interrupts playback) | `{"type":"input_audio_buffer.speech_started"}` | Clears audio queue and playback buffer; fires `openai_speech_stop` if playback was active |
 | User speech stopped | `{"type":"input_audio_buffer.speech_stopped"}` | Logged; playback remains cleared until new audio arrives |
 | Audio response complete | `{"type":"response.output_audio.done"}` | Sets response done flag and allows `openai_speech_stop` to fire after playback drains |
 | Error reporting | Any JSON with `"type"` containing `"error"` | Logged as error |
@@ -273,7 +273,7 @@ In raw audio mode, control messages from the backend, such as `input_audio_buffe
 - `input_audio_buffer.speech_started` is used internally for barge-in, clearing queued playback audio. This typically corresponds to VAD being triggered by the backend.
 - `input_audio_buffer.speech_stopped` is logged and forwarded through the normal JSON event flow.
 - `mod_openai_audio_stream::openai_speech_start` is emitted by the module when playback actually starts.
-- `mod_openai_audio_stream::openai_speech_stop` is emitted by the module when playback has fully drained after `response.output_audio.done`.
+- `mod_openai_audio_stream::openai_speech_stop` is emitted by the module when playback has fully drained after `response.output_audio.done`, or immediately when playback is interrupted by barge-in.
 
 ### response
 Message received from websocket endpoint. Json expected, but it contains whatever the websocket server's response is.
