@@ -1,6 +1,7 @@
 # mod_openai_realtime 
 
 ![Build](https://github.com/VoiSmart/mod_openai_realtime/actions/workflows/build.yml/badge.svg?branch=main)
+![Tests](https://github.com/VoiSmart/mod_openai_realtime/actions/workflows/tests.yml/badge.svg?branch=main)
 ![Code-Checks](https://github.com/VoiSmart/mod_openai_realtime/actions/workflows/code-checks.yml/badge.svg?branch=main)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat)](LICENSE)
 
@@ -59,7 +60,7 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make
 sudo make install
 ```
-**TLS** is `OFF` by default. To build with TLS support add `-DUSE_TLS=ON` to cmake line.
+**TLS** support is enabled by the current CMake configuration.
 
 ### Getting started
 
@@ -97,11 +98,11 @@ The following channel variables can be used to fine-tune websocket connection an
 | Variable                               | Description                                             | Default |
 | -------------------------------------- | ------------------------------------------------------- | ------- |
 | STREAM_MESSAGE_DEFLATE                 | true or 1, disables per message deflate                 | off     |
-| STREAM_HEART_BEAT                      | number of seconds, interval to send the heart beat      | off     |
+| STREAM_HEART_BEAT                      | number of seconds (1 to 3600), interval to send the heart beat | off     |
 | STREAM_SUPPRESS_LOG                    | true or 1, suppresses printing to log                   | off     |
-| STREAM_BUFFER_SIZE                     | buffer duration in milliseconds, divisible by 20        | 20      |
-| STREAM_EXTRA_HEADERS                   | JSON object for additional headers in string format     | none    |
-| STREAM_NO_RECONNECT                    | true or 1, disables automatic websocket reconnection    | off     |
+| STREAM_BUFFER_SIZE                     | buffer duration in milliseconds, divisible by 20, max 1000 | 20      |
+| STREAM_EXTRA_HEADERS                   | JSON object for additional headers in string format; merged with the Authorization header when STREAM_OPENAI_API_KEY is set (Authorization takes precedence) | none    |
+| STREAM_NO_RECONNECT                    | true or 1, disables automatic websocket reconnection; when the connection closes, pending audio is played out and the stream stops | off     |
 | STREAM_TLS_CA_FILE                     | CA cert or bundle, or the special values SYSTEM or NONE | SYSTEM  |
 | STREAM_TLS_KEY_FILE                    | optional client key for WSS connections                 | none    |
 | STREAM_TLS_CERT_FILE                   | optional client cert for WSS connections                | none    |
@@ -124,6 +125,7 @@ you would set this variable to 100. If ommited, default packet size of 20ms will
       "Header2": "Value2",
       "Header3": "Value3"
   }
+  ```
 - Websocket automatic reconnection is on by default. To disable it set this channel variable to true or 1.
 - TLS (for WSS) options can be fine tuned with the `STREAM_TLS_*` channel variables:
   - `STREAM_TLS_CA_FILE` the ca certificate (or certificate bundle) file. By default is `SYSTEM` which means use the system defaults.
@@ -155,7 +157,7 @@ Because text frames continue to be processed through the normal `processMessage(
 
 | Feature | Required text event from backend | Effect |
 | --- | --- | --- |
-| Barge-in (user interrupts playback) | `{"type":"input_audio_buffer.speech_started"}` | Clears audio queue and playback buffer |
+| Barge-in (user interrupts playback) | `{"type":"input_audio_buffer.speech_started"}` | Clears audio queue and playback buffer; fires `openai_speech_stop` if playback was active |
 | User speech stopped | `{"type":"input_audio_buffer.speech_stopped"}` | Logged; playback remains cleared until new audio arrives |
 | Audio response complete | `{"type":"response.output_audio.done"}` | Sets response done flag and allows `openai_speech_stop` to fire after playback drains |
 | Error reporting | Any JSON with `"type"` containing `"error"` | Logged as error |
@@ -208,12 +210,12 @@ Attaches a media bug and starts streaming audio (in L16 format) to the websocket
   - "8k" = 8000 Hz
   - "16k" = 16000 Hz
   - "24k" = 24000 Hz (default)
-  - or any multiple of 8000
+  - or any multiple of 8000 up to 48000
 - `playback-rate` - optional, the sample rate at which audio arrives from the server. The module resamples from this rate to the channel codec rate for playback. Choice of
   - "8k" = 8000 Hz
   - "16k" = 16000 Hz
   - "24k" = 24000 Hz (default)
-  - or any multiple of 8000
+  - or any multiple of 8000 up to 48000
   - If omitted, defaults to 24000 (OpenAI Realtime API rate). When using raw audio mode with a custom backend that sends audio at a different rate, set this to match the source audio rate.
 - `mute_user` - optional flag. When present, the module initialises muted and ignores caller audio until an explicit `unmute`.
 - **IMPORTANT NOTE**: The OpenAI Realtime API, when using PCM audio format, expects the audio to be in 24 kHz sample rate. The module now defaults `send-rate` to `24k` for this reason, and mono remains the recommended mode for OpenAI Realtime. You can still override `send-rate` explicitly if you are targeting a different backend. From the OpenAI Realtime API documentation: *input audio must be 16-bit PCM at a 24kHz sample rate, single channel (mono), and little-endian byte order.* When using raw audio mode with a custom backend, the `playback-rate` parameter lets you specify the rate of audio sent back for playback, avoiding pitch/speed distortion from incorrect resampling.
@@ -227,13 +229,15 @@ Uses the same arguments as `uuid_openai_audio_stream ... start ...`, but forces 
 All lifecycle commands (`stop`, `pause`, `resume`, `mute`, `unmute`, and `send_json`) are available on both `uuid_openai_audio_stream` and `uuid_raw_audio_stream`, because `uuid_raw_audio_stream` only changes how `start` selects raw audio mode and does not create a separate control plane. For clarity and consistency, prefer controlling the stream through the same API family used for `start`.
 
 ```
-uuid_openai_audio_stream <uuid> send_json
+uuid_openai_audio_stream <uuid> send_json <base64json>
 ```
 Sends a json object **base64 encoded** to the OpenAI websocket endpoint. Requires a valid `base64` text and a valid json compliant to the OpenAI Realtime API specification. The reason for base64 encoding is that spaces, new lines and other special characters in the json object can cause issues with the freeswitch API command parsing.
 
 ```
-uuid_openai_audio_stream <uuid> stop 
+uuid_openai_audio_stream <uuid> stop [<base64json>]
 ```
+Stops the stream. When the optional base64-encoded JSON payload is present, the module validates and sends it before
+closing the WebSocket connection.
 
 ```
 uuid_openai_audio_stream <uuid> pause
@@ -273,7 +277,7 @@ In raw audio mode, control messages from the backend, such as `input_audio_buffe
 - `input_audio_buffer.speech_started` is used internally for barge-in, clearing queued playback audio. This typically corresponds to VAD being triggered by the backend.
 - `input_audio_buffer.speech_stopped` is logged and forwarded through the normal JSON event flow.
 - `mod_openai_audio_stream::openai_speech_start` is emitted by the module when playback actually starts.
-- `mod_openai_audio_stream::openai_speech_stop` is emitted by the module when playback has fully drained after `response.output_audio.done`.
+- `mod_openai_audio_stream::openai_speech_stop` is emitted by the module when playback has fully drained after `response.output_audio.done`, or immediately when playback is interrupted by barge-in.
 
 ### response
 Message received from websocket endpoint. Json expected, but it contains whatever the websocket server's response is.

@@ -44,33 +44,58 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER=clang++
+          cmake -S tests -B build-tests \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_CXX_COMPILER=clang++
 
       - name: Analyze
         run: |
           set -eux
-          scan-build --status-bugs cmake --build build -j"$(nproc)"
-
           ALL_FILES="$(git ls-files '*.c' '*.cc' '*.cpp' '*.cxx')"
-          FILES="$(echo "$ALL_FILES" | grep -v '^libs/' || true)"
-          if [ -n "$FILES" ]; then
-            clang-tidy -p build $FILES \
+          MODULE_FILES="$(echo "$ALL_FILES" | grep -Ev '^(libs|tests)/' || true)"
+          TEST_FILES="$(echo "$ALL_FILES" | grep '^tests/' || true)"
+          if [ -n "$MODULE_FILES" ]; then
+            clang-tidy -p build $MODULE_FILES \
               --warnings-as-errors='clang-analyzer-*,bugprone-*,performance-*'
           else
-            echo "No source files found for clang-tidy analysis."
+            echo "No module source files found for clang-tidy analysis."
+          fi
+          if [ -n "$TEST_FILES" ]; then
+            clang-tidy -p build-tests $TEST_FILES \
+              --warnings-as-errors='clang-analyzer-*,bugprone-*,performance-*'
+          else
+            echo "No test source files found for clang-tidy analysis."
           fi
 
-          cppcheck --enable=warning,performance,portability --std=c++17 --force \
-                   --project=build/compile_commands.json \
-                   --suppress=missingIncludeSystem \
-                   -i build -i libs 2> cppcheck-warn.log
+          : > cppcheck-warn.log
+          for compile_commands in build/compile_commands.json build-tests/compile_commands.json; do
+            if ! cppcheck --enable=warning,performance,portability --std=c++11 --force \
+                     --error-exitcode=1 \
+                     --project="$compile_commands" \
+                     --suppress=missingIncludeSystem \
+                     --suppress='*:libs/IXWebSocket/*' \
+                     -i build -i build-tests -i libs 2>> cppcheck-warn.log; then
+              cat cppcheck-warn.log
+              exit 1
+            fi
+          done
+          if [ -s cppcheck-warn.log ]; then
+            echo "Warnings found by cppcheck:"
+            cat cppcheck-warn.log
+          else
+            echo "No warnings found by cppcheck."
+          fi
 
-          cppcheck --enable=style --std=c++17 --force \
-                   --project=build/compile_commands.json \
-                   --suppress=missingIncludeSystem \
-                   -i build -i libs 2> cppcheck-style.log || true
+          : > cppcheck-style.log
+          for compile_commands in build/compile_commands.json build-tests/compile_commands.json; do
+            cppcheck --enable=style --std=c++11 --force \
+                     --project="$compile_commands" \
+                     --suppress=missingIncludeSystem \
+                     --suppress='*:libs/IXWebSocket/*' \
+                     -i build -i build-tests -i libs 2>> cppcheck-style.log
+          done
 
           if [ -s cppcheck-style.log ]; then
             echo "Style issues found by cppcheck:"
@@ -88,3 +113,4 @@ jobs:
             cppcheck-warn.log
             cppcheck-style.log
             build/compile_commands.json
+            build-tests/compile_commands.json

@@ -39,17 +39,25 @@ add_library(mod_openai_audio_stream SHARED
     mod_openai_audio_stream.h
     openai_audio_streamer_glue.h
     openai_audio_streamer_glue.cpp
+    stream_protocol.cpp
+    stream_protocol.h
     base64.cpp
 )
 
 set_property(TARGET mod_openai_audio_stream PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-target_include_directories(mod_openai_audio_stream PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libs/IXWebSocket)
+target_include_directories(mod_openai_audio_stream PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/libs/IXWebSocket
+    ${SPEEXDSP_INCLUDE_DIRS}
+)
 
-target_link_libraries(mod_openai_audio_stream PRIVATE PkgConfig::FreeSWITCH pthread)
-target_link_libraries (mod_openai_audio_stream PRIVATE ixwebsocket)
+target_link_libraries(mod_openai_audio_stream PRIVATE
+    PkgConfig::FreeSWITCH
+    ${SPEEXDSP_LIBRARIES}
+    ixwebsocket
+    pthread
+)
 
 install(TARGETS ${PROJECT_NAME}
         COMPONENT ${PROJECT_NAME}
         DESTINATION ${FS_MOD_DIR})
-

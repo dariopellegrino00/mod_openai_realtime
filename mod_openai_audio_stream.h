@@ -8,6 +8,8 @@
 #define MY_BUG_NAME "audio_stream"
 #define MAX_SESSION_ID (256)
 #define MAX_WS_URI (4096)
+#define STREAM_MIN_SAMPLING (8000)
+#define STREAM_MAX_SAMPLING (48000)
 
 #define EVENT_CONNECT "mod_openai_audio_stream::connect"
 #define EVENT_DISCONNECT "mod_openai_audio_stream::disconnect"
@@ -23,16 +25,13 @@ struct private_data {
     switch_mutex_t *mutex;
     char sessionId[MAX_SESSION_ID];
     SpeexResamplerState *resampler;
-    responseHandler_t responseHandler;
     void *pAudioStreamer;
-    char ws_uri[MAX_WS_URI];
     int sampling;
     int channels;
-    int audio_paused : 1;
-    int user_audio_muted : 1;
-    int openai_audio_muted : 1;
-    int close_requested : 1;
-    int raw_audio_mode : 1;
+    switch_atomic_t audio_paused;
+    switch_atomic_t user_audio_muted;
+    switch_atomic_t openai_audio_muted;
+    switch_atomic_t close_requested;
     switch_buffer_t *sbuffer;
     int rtp_packets;
     switch_buffer_t *playback_buffer;
