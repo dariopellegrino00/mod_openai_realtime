@@ -17,7 +17,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
@@ -26,16 +26,18 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build test image
+      - name: Build integration environment
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.ci
-          target: integration-test
+          target: integration
           load: true
-          tags: mod-openai-audio-stream-integration:test
-          cache-from: type=gha,scope=integration-test
-          cache-to: type=gha,mode=max,scope=integration-test,ignore-error=true
+          tags: mod-openai-realtime-integration:ci
+          cache-from: type=gha,scope=integration
+          cache-to: type=gha,mode=max,scope=integration,ignore-error=true
 
       - name: Run unit and integration tests
-        run: docker run --rm mod-openai-audio-stream-integration:test
+        env:
+          INTEGRATION_BASE_IMAGE: mod-openai-realtime-integration:ci
+        run: ./tests/run-integration.sh
