@@ -1,6 +1,7 @@
 # mod_openai_realtime 
 
 ![Build](https://github.com/VoiSmart/mod_openai_realtime/actions/workflows/build.yml/badge.svg?branch=main)
+![Tests](https://github.com/VoiSmart/mod_openai_realtime/actions/workflows/tests.yml/badge.svg?branch=main)
 ![Code-Checks](https://github.com/VoiSmart/mod_openai_realtime/actions/workflows/code-checks.yml/badge.svg?branch=main)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat)](LICENSE)
 
