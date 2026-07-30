@@ -1,0 +1,115 @@
+name: CI Images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile.ci
+      - .github/workflows/ci-images.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ci-images
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build CI images
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+
+      - name: Set image name
+        id: image
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner=$(printf '%s' "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/${owner}/mod-openai-realtime-ci" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: SDK image metadata
+        id: sdk-meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=sdk-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.title=mod_openai_realtime CI SDK
+            org.opencontainers.image.description=Build and static-analysis environment for mod_openai_realtime
+
+      - name: Build SDK image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.ci
+          target: sdk
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.sdk-meta.outputs.tags }}
+          labels: ${{ steps.sdk-meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ steps.image.outputs.name }}:buildcache
+          cache-to: type=registry,ref=${{ steps.image.outputs.name }}:buildcache,mode=max,ignore-error=true
+
+      - name: Integration image metadata
+        id: integration-meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=integration-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.title=mod_openai_realtime integration environment
+            org.opencontainers.image.description=Pinned FreeSWITCH runtime and SDK for mod_openai_realtime tests
+
+      - name: Build integration image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.ci
+          target: integration
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.integration-meta.outputs.tags }}
+          labels: ${{ steps.integration-meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ steps.image.outputs.name }}:buildcache
+          cache-to: type=registry,ref=${{ steps.image.outputs.name }}:buildcache,mode=max,ignore-error=true
+
+      - name: Test published integration image
+        env:
+          INTEGRATION_BASE_IMAGE: ${{ steps.image.outputs.name }}:integration-${{ github.sha }}
+          TEST_IMAGE: mod-openai-realtime-tests:${{ github.sha }}
+        run: ./tests/run-integration.sh
+
+      - name: Promote verified aliases
+        if: github.ref == 'refs/heads/main'
+        env:
+          CI_IMAGE: ${{ steps.image.outputs.name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          docker buildx imagetools create \
+            --tag "${CI_IMAGE}:sdk" \
+            "${CI_IMAGE}:sdk-${COMMIT_SHA}"
+          docker buildx imagetools create \
+            --tag "${CI_IMAGE}:integration" \
+            "${CI_IMAGE}:integration-${COMMIT_SHA}"
