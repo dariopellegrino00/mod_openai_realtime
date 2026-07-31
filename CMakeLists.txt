@@ -1,8 +1,14 @@
 cmake_minimum_required(VERSION 3.18)
+
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" MOD_OPENAI_REALTIME_VERSION LIMIT_COUNT 1)
+if(NOT MOD_OPENAI_REALTIME_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "VERSION must contain a semantic version in MAJOR.MINOR.PATCH format")
+endif()
+
 project(mod_openai_audio_stream
-        VERSION 1.0.0
+        VERSION "${MOD_OPENAI_REALTIME_VERSION}"
         DESCRIPTION "Audio streaming module for FreeSWITCH."
-        HOMEPAGE_URL "https://github.com/VoiSmart/mod_openai_realtime") 
+        HOMEPAGE_URL "https://github.com/VoiSmart/mod_openai_realtime")
 
 include(GNUInstallDirs)
 
