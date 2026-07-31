@@ -9,6 +9,7 @@ test_image=${TEST_IMAGE:-${legacy_test_image:-mod-openai-realtime-tests:local}}
 
 docker_build() {
     if docker buildx version >/dev/null 2>&1; then
+        # The test image must be loaded into the local daemon for the docker run below.
         docker buildx build --builder default --load "$@"
     else
         docker build "$@"
@@ -17,10 +18,12 @@ docker_build() {
 
 if [ -z "${INTEGRATION_BASE_IMAGE-}" ] && ! docker pull "${base_image}"; then
     if docker image inspect "${base_image}" >/dev/null 2>&1; then
-        echo "Published integration image is unavailable; using the cached copy." >&2
+        echo "Published integration image could not be pulled; using the cached copy." >&2
     else
         base_image=mod-openai-realtime-integration-base:local
-        echo "Published integration image is unavailable; building the base image locally." >&2
+        echo "Published integration image could not be pulled." >&2
+        echo "It may not exist yet, the network may be unavailable, or you may not be logged in to ghcr.io." >&2
+        echo "Building the integration base image locally." >&2
         echo "A cold build compiles FreeSWITCH and may take up to one hour." >&2
         docker_build \
             --file "${project_dir}/Dockerfile.ci" \
