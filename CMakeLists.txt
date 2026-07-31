@@ -17,16 +17,14 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 find_package(PkgConfig REQUIRED)
 find_package(SpeexDSP REQUIRED)
-find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
-find_package(ZLIB REQUIRED)
 
 pkg_check_modules(FreeSWITCH REQUIRED IMPORTED_TARGET freeswitch)
 pkg_get_variable(FS_MOD_DIR freeswitch modulesdir)
 message(STATUS "FreeSWITCH modules dir: ${FS_MOD_DIR}")
 
-set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "Disable ixwebsocket installation" FORCE)
-set(USE_TLS ON CACHE BOOL "Use TLS for secure WebSocket connections" FORCE)
+set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "Disable ixwebsocket installation")
+option(USE_TLS "Use TLS for secure WebSocket connections" ON)
 add_subdirectory(libs/IXWebSocket)
 
 if(CMAKE_BUILD_TYPE MATCHES "Release")

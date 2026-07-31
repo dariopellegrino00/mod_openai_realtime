@@ -28,7 +28,7 @@ But not only that: the module can also be used as a generic WebSocket audio brid
 ## Installation
 
 ### Dependencies
-To build the module, make sure `FreeSWITCH development headers`, `OpenSSL`, `Zlib` and `SpeexDSP` development packages are installed on your system.
+To build the module on Linux with its default TLS support, install the `FreeSWITCH development headers`, `OpenSSL`, `Zlib` and `SpeexDSP` development packages. OpenSSL is optional only when configuring the build with `-DUSE_TLS=OFF`; other platforms use the TLS backend selected by IXWebSocket.
 
 Depending on your Linux distribution, you can install them like this:
 
@@ -60,7 +60,7 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make
 sudo make install
 ```
-**TLS** support is enabled by the current CMake configuration.
+**TLS** support is enabled by default. Pass `-DUSE_TLS=OFF` to CMake to build without TLS support; that build supports `ws://` endpoints but not `wss://` endpoints.
 
 ### Getting started
 
