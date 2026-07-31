@@ -6,9 +6,6 @@ project(mod_openai_audio_stream
 
 include(GNUInstallDirs)
 
-set(CMAKE_SHARED_LIBRARY_PREFIX "")
-set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g")
-
 option(ENABLE_LOCAL "Enable local compile/debug specific" OFF)
 if(ENABLE_LOCAL)
     set(ENV{PKG_CONFIG_PATH} "/usr/local/freeswitch/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
@@ -27,11 +24,6 @@ set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "Disable ixwebsocket installation")
 option(USE_TLS "Use TLS for secure WebSocket connections" ON)
 add_subdirectory(libs/IXWebSocket)
 
-if(CMAKE_BUILD_TYPE MATCHES "Release")
-    # Add linker flags to strip symbols and reduce size of static library
-    set_target_properties(ixwebsocket PROPERTIES LINK_FLAGS_RELEASE "-s -w") #-static-libgcc -static-libstdc++
-endif()
-
 add_library(mod_openai_audio_stream SHARED
     mod_openai_audio_stream.c
     mod_openai_audio_stream.h
@@ -43,6 +35,7 @@ add_library(mod_openai_audio_stream SHARED
 )
 
 set_target_properties(mod_openai_audio_stream PROPERTIES
+    PREFIX ""
     POSITION_INDEPENDENT_CODE ON
     C_EXTENSIONS ON
     CXX_STANDARD 11
