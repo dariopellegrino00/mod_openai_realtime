@@ -2,26 +2,24 @@ name: Static Checks
 
 on:
   push:
-    branches: [ main, develop ] # never pushing directly to main
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
+    branches: [main, develop]
   workflow_dispatch:
 
 permissions:
   contents: read
-  packages: read   # to pull from private GHCR
 
 jobs:
   analyze:
     runs-on: ubuntu-22.04
     container:
-      image: ghcr.io/voismart/freeswitch-sdk:ci # make org name dynamic in case of future org name changes 
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+      # Published together with the integration digest from main@9b310c95.
+      # Update this, build.yml and tests.yml from the same CI Images run.
+      image: ghcr.io/voismart/mod-openai-realtime-ci@sha256:10d209dc05d03c5f79b9831a4f674ea4d1c9f71e39ffe8b458e0a96ad7bff293
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -75,8 +73,10 @@ jobs:
                      --error-exitcode=1 \
                      --project="$compile_commands" \
                      --suppress=missingIncludeSystem \
-                     --suppress='*:libs/IXWebSocket/*' \
-                     -i build -i build-tests -i libs 2>> cppcheck-warn.log; then
+                     --suppress='*:*libs/IXWebSocket/*' \
+                     -i "$GITHUB_WORKSPACE/build" \
+                     -i "$GITHUB_WORKSPACE/build-tests" \
+                     -i "$GITHUB_WORKSPACE/libs" 2>> cppcheck-warn.log; then
               cat cppcheck-warn.log
               exit 1
             fi
@@ -93,8 +93,10 @@ jobs:
             cppcheck --enable=style --std=c++11 --force \
                      --project="$compile_commands" \
                      --suppress=missingIncludeSystem \
-                     --suppress='*:libs/IXWebSocket/*' \
-                     -i build -i build-tests -i libs 2>> cppcheck-style.log
+                     --suppress='*:*libs/IXWebSocket/*' \
+                     -i "$GITHUB_WORKSPACE/build" \
+                     -i "$GITHUB_WORKSPACE/build-tests" \
+                     -i "$GITHUB_WORKSPACE/libs" 2>> cppcheck-style.log
           done
 
           if [ -s cppcheck-style.log ]; then
@@ -106,7 +108,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: static-checks-logs
           path: |

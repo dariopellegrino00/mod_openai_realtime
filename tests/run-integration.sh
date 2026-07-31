@@ -9,6 +9,7 @@ test_image=${TEST_IMAGE:-${legacy_test_image:-mod-openai-realtime-tests:local}}
 
 docker_build() {
     if docker buildx version >/dev/null 2>&1; then
+        # The test image must be loaded into the local daemon for the docker run below.
         docker buildx build --builder default --load "$@"
     else
         docker build "$@"
