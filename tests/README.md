@@ -47,10 +47,10 @@ duration and dominant frequency, exercising the playback queue and resampling pa
 ./tests/run-integration.sh
 ```
 
-By default, the script pulls the verified `integration` alias from the public image published by this repository. If
-it is not available yet, it uses a cached copy or builds the `integration` target locally. `tests/Dockerfile` then adds
-the current checkout without embedding it in the base image, and `tests/run-integration.sh` starts a fresh test
-container.
+By default, the script pulls the verified `integration` alias published by this repository. While the package is
+private, authorized users can authenticate with `docker login ghcr.io`; other users automatically use a cached copy
+or build the `integration` target locally. `tests/Dockerfile` then adds the current checkout without embedding it in
+the base image, and `tests/run-integration.sh` starts a fresh test container.
 
 A cold local fallback compiles FreeSWITCH and can take up to one hour; subsequent unchanged builds reuse Docker's
 layer cache. To validate changes to `Dockerfile.ci`, explicitly build and select a local base image:
