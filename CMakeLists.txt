@@ -6,7 +6,6 @@ project(mod_openai_audio_stream
 
 include(GNUInstallDirs)
 
-set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g")
 
@@ -19,6 +18,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(PkgConfig REQUIRED)
 find_package(SpeexDSP REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
 pkg_check_modules(FreeSWITCH REQUIRED IMPORTED_TARGET freeswitch)
@@ -44,7 +44,15 @@ add_library(mod_openai_audio_stream SHARED
     base64.cpp
 )
 
-set_property(TARGET mod_openai_audio_stream PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_target_properties(mod_openai_audio_stream PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    C_EXTENSIONS ON
+    CXX_STANDARD 11
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS ON
+)
+
+target_compile_features(mod_openai_audio_stream PRIVATE c_std_99)
 
 target_include_directories(mod_openai_audio_stream PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/IXWebSocket
@@ -55,7 +63,7 @@ target_link_libraries(mod_openai_audio_stream PRIVATE
     PkgConfig::FreeSWITCH
     ${SPEEXDSP_LIBRARIES}
     ixwebsocket
-    pthread
+    Threads::Threads
 )
 
 install(TARGETS ${PROJECT_NAME}
