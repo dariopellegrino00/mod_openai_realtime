@@ -101,7 +101,6 @@ static switch_status_t start_capture(switch_core_session_t *session, switch_medi
     switch_codec_t *read_codec;
 
     void *pUserData = NULL;
-    int channels = (flags & SMBF_STEREO) ? 2 : 1;
 
     if (switch_channel_get_private(channel, MY_BUG_NAME)) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
@@ -123,10 +122,17 @@ static switch_status_t start_capture(switch_core_session_t *session, switch_medi
         return SWITCH_STATUS_FALSE;
     }
 
+    const stream_start_options_t options = {
+        .websocket_uri = wsUri,
+        .capture_input_rate = read_codec->implementation->actual_samples_per_second,
+        .capture_output_rate = sampling,
+        .playback_input_rate = playback_sampling,
+        .channels = (flags & SMBF_STEREO) ? 2 : 1,
+        .start_muted = start_muted,
+        .force_raw_audio_mode = force_raw_audio_mode,
+    };
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "calling stream_session_init.\n");
-    if (SWITCH_STATUS_FALSE ==
-        stream_session_init(session, responseHandler, read_codec->implementation->actual_samples_per_second, wsUri,
-                            sampling, playback_sampling, channels, start_muted, force_raw_audio_mode, &pUserData)) {
+    if (SWITCH_STATUS_FALSE == stream_session_init(session, responseHandler, &options, &pUserData)) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "Error initializing mod_openai_audio_stream session.\n");
         return SWITCH_STATUS_FALSE;

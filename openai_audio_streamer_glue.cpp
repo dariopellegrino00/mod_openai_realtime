@@ -34,6 +34,33 @@
 #define MAX_STREAM_BUFFER_MS 1000  /* upper bound for the STREAM_BUFFER_SIZE capture aggregation window */
 #define MAX_HEARTBEAT_SECONDS 3600 /* upper bound for the STREAM_HEART_BEAT ping interval */
 
+namespace {
+
+struct StreamConfig {
+    // String pointers are borrowed only for the synchronous stream_data_init construction path;
+    // AudioStreamer copies every value it needs and never retains the pointers.
+    const char *websocket_uri;
+    uint32_t capture_input_rate;
+    uint32_t capture_output_rate;
+    uint32_t playback_input_rate;
+    uint32_t playback_output_rate;
+    int channels;
+    responseHandler_t response_handler;
+    bool disable_per_message_deflate;
+    int heartbeat_seconds;
+    bool suppress_log;
+    int capture_packet_count;
+    const char *extra_headers;
+    bool disable_reconnect;
+    const char *tls_ca_file;
+    const char *tls_key_file;
+    const char *tls_cert_file;
+    bool disable_tls_hostname_validation;
+    bool disable_audio_files;
+    bool start_muted;
+    bool raw_audio_mode;
+};
+
 // Persistent buffers for stream_frame to avoid per-frame heap allocations
 struct StreamBuffers {
     std::vector<uint8_t> flush_buffer;
@@ -49,20 +76,17 @@ struct StreamBuffers {
 
 class AudioStreamer {
   public:
-    AudioStreamer(const char *uuid, const char *wsUri, responseHandler_t callback, int deflate, int heart_beat,
-                  bool suppressLog, const char *extra_headers, bool no_reconnect, const char *tls_cafile,
-                  const char *tls_keyfile, const char *tls_certfile, bool tls_disable_hostname_validation,
-                  uint32_t session_sampling, uint32_t playback_sampling, bool disable_audiofiles, bool raw_audio_mode,
-                  private_t *context)
-        : m_sessionId(uuid), m_notify(callback), m_suppress_log(suppressLog), m_playFile(0),
-          m_disable_audiofiles(disable_audiofiles), m_raw_audio_mode(raw_audio_mode), m_context(context) {
+    AudioStreamer(const char *session_id, const StreamConfig& config, private_t *context)
+        : m_sessionId(session_id), m_notify(config.response_handler), m_suppress_log(config.suppress_log),
+          m_playFile(0), m_disable_audiofiles(config.disable_audio_files), m_raw_audio_mode(config.raw_audio_mode),
+          m_context(context) {
 
-        in_sample_rate = playback_sampling;
+        in_sample_rate = config.playback_input_rate;
 
         ix::WebSocketHttpHeaders headers;
         ix::SocketTLSOptions tlsOptions;
-        if (extra_headers) {
-            cJSON *headers_json = cJSON_Parse(extra_headers);
+        if (config.extra_headers) {
+            cJSON *headers_json = cJSON_Parse(config.extra_headers);
             if (!headers_json || headers_json->type != cJSON_Object) {
                 // misconfigured headers lead to hard-to-diagnose auth failures: make it visible
                 switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
@@ -84,41 +108,41 @@ class AudioStreamer {
             cJSON_Delete(headers_json);
         }
 
-        webSocket.setUrl(wsUri);
+        webSocket.setUrl(config.websocket_uri);
 
         // Setup eventual TLS options.
         // tls_cafile may hold the special values
         // NONE, which disables validation and SYSTEM which uses
         // the system CAs bundle
-        if (tls_cafile) {
-            tlsOptions.caFile = tls_cafile;
+        if (config.tls_ca_file) {
+            tlsOptions.caFile = config.tls_ca_file;
         }
 
-        if (tls_keyfile) {
-            tlsOptions.keyFile = tls_keyfile;
+        if (config.tls_key_file) {
+            tlsOptions.keyFile = config.tls_key_file;
         }
 
-        if (tls_certfile) {
-            tlsOptions.certFile = tls_certfile;
+        if (config.tls_cert_file) {
+            tlsOptions.certFile = config.tls_cert_file;
         }
 
-        tlsOptions.disable_hostname_validation = tls_disable_hostname_validation;
+        tlsOptions.disable_hostname_validation = config.disable_tls_hostname_validation;
         webSocket.setTLSOptions(tlsOptions);
 
         // Optional heart beat, sent every xx seconds when there is not any traffic
         // to make sure that load balancers do not kill an idle connection.
-        if (heart_beat)
-            webSocket.setPingInterval(heart_beat);
+        if (config.heartbeat_seconds)
+            webSocket.setPingInterval(config.heartbeat_seconds);
 
         // Per message deflate connection is enabled by default. You can tweak its parameters or disable it
-        if (deflate)
+        if (config.disable_per_message_deflate)
             webSocket.disablePerMessageDeflate();
 
         // Set extra headers if any
         if (!headers.empty())
             webSocket.setExtraHeaders(headers);
 
-        if (no_reconnect)
+        if (config.disable_reconnect)
             webSocket.disableAutomaticReconnection();
 
         // Setup a callback to be fired when a message or an event (open, close, error) is received
@@ -214,7 +238,7 @@ class AudioStreamer {
             }
         });
 
-        out_sample_rate = session_sampling;
+        out_sample_rate = config.playback_output_rate;
         if (in_sample_rate != out_sample_rate) {
             int err = 0;
             m_resampler = speex_resampler_init(1, in_sample_rate, out_sample_rate, SWITCH_RESAMPLE_QUALITY, &err);
@@ -811,8 +835,6 @@ class AudioStreamer {
     bool m_has_pending_raw_byte = false; // WebSocket thread only
 };
 
-namespace {
-
 using LifecycleMutex = std::recursive_mutex;
 
 struct LifecycleLockHandle {
@@ -882,13 +904,7 @@ class LifecycleLockScope {
     LifecycleLockHandle *m_handle;
 };
 
-switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *session, char *wsUri, uint32_t sampling,
-                                 uint32_t playback_target_rate, int desiredSampling, int playback_sampling,
-                                 int channels, responseHandler_t responseHandler, int deflate, int heart_beat,
-                                 bool suppressLog, int rtp_packets, const char *extra_headers, bool no_reconnect,
-                                 const char *tls_cafile, const char *tls_keyfile, const char *tls_certfile,
-                                 bool tls_disable_hostname_validation, bool disable_audiofiles,
-                                 switch_bool_t start_muted, bool raw_audio_mode) {
+switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *session, const StreamConfig& config) {
     int err; // speex
 
     switch_memory_pool_t *pool = switch_core_session_get_pool(session);
@@ -897,15 +913,16 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
 
     strncpy(tech_pvt->sessionId, switch_core_session_get_uuid(session), MAX_SESSION_ID - 1);
     tech_pvt->sessionId[MAX_SESSION_ID - 1] = '\0';
-    tech_pvt->sampling = desiredSampling;
-    tech_pvt->rtp_packets = rtp_packets;
-    tech_pvt->channels = channels;
+    tech_pvt->sampling = config.capture_output_rate;
+    tech_pvt->rtp_packets = config.capture_packet_count;
+    tech_pvt->channels = config.channels;
     switch_atomic_set(&tech_pvt->audio_paused, 0);
-    switch_atomic_set(&tech_pvt->user_audio_muted, start_muted ? 1 : 0);
+    switch_atomic_set(&tech_pvt->user_audio_muted, config.start_muted ? 1 : 0);
     switch_atomic_set(&tech_pvt->openai_audio_muted, 0);
     switch_atomic_set(&tech_pvt->close_requested, 0);
 
-    const size_t buflen = static_cast<size_t>(FRAME_SIZE_8000) * desiredSampling / 8000 * channels * rtp_packets;
+    const size_t buflen = static_cast<size_t>(FRAME_SIZE_8000) * config.capture_output_rate / 8000 * config.channels *
+                          config.capture_packet_count;
     const size_t playback_buflen = 128000; // 128KB may need to be decreased
 
     if (switch_buffer_create(pool, &tech_pvt->playback_buffer, playback_buflen) != SWITCH_STATUS_SUCCESS) {
@@ -918,10 +935,7 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
     // boundary. tech_pvt was memset to zero, so the caller's destroy_tech_pvt() safely tears down
     // whatever was already built.
     try {
-        tech_pvt->pAudioStreamer = static_cast<void *>(new AudioStreamer(
-            tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat, suppressLog, extra_headers, no_reconnect,
-            tls_cafile, tls_keyfile, tls_certfile, tls_disable_hostname_validation, playback_target_rate,
-            playback_sampling, disable_audiofiles, raw_audio_mode, tech_pvt));
+        tech_pvt->pAudioStreamer = static_cast<void *>(new AudioStreamer(tech_pvt->sessionId, config, tech_pvt));
         tech_pvt->stream_buffers = static_cast<void *>(new StreamBuffers());
     } catch (const std::exception& e) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
@@ -941,10 +955,11 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
         return SWITCH_STATUS_FALSE;
     }
 
-    if (static_cast<uint32_t>(desiredSampling) != sampling) {
+    if (config.capture_output_rate != config.capture_input_rate) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) resampling from %u to %u\n",
-                          tech_pvt->sessionId, sampling, desiredSampling);
-        tech_pvt->resampler = speex_resampler_init(channels, sampling, desiredSampling, SWITCH_RESAMPLE_QUALITY, &err);
+                          tech_pvt->sessionId, config.capture_input_rate, config.capture_output_rate);
+        tech_pvt->resampler = speex_resampler_init(config.channels, config.capture_input_rate,
+                                                   config.capture_output_rate, SWITCH_RESAMPLE_QUALITY, &err);
         if (0 != err) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                               "Error initializing resampler: %s.\n", speex_resampler_strerror(err));
@@ -1219,9 +1234,7 @@ switch_status_t stream_session_set_openai_mute(switch_core_session_t *session, i
 }
 
 switch_status_t stream_session_init(switch_core_session_t *session, responseHandler_t responseHandler,
-                                    uint32_t samples_per_second, char *wsUri, int sampling, int playback_sampling,
-                                    int channels, switch_bool_t start_muted, switch_bool_t force_raw_audio_mode,
-                                    void **ppUserData) {
+                                    const stream_start_options_t *options, void **ppUserData) {
     int deflate = 0, heart_beat = 0;
     bool suppressLog = false;
     const char *buffer_size;
@@ -1234,7 +1247,7 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
     const char *openai_api_key = NULL;
     bool tls_disable_hostname_validation = false;
     bool disable_audiofiles = false;
-    bool raw_audio_mode = force_raw_audio_mode ? true : false;
+    bool raw_audio_mode = options->force_raw_audio_mode != SWITCH_FALSE;
     std::string authorization_header_json;
 
     switch_channel_t *channel = switch_core_session_get_channel(session);
@@ -1266,7 +1279,7 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
 
     if (switch_channel_var_true(channel, "STREAM_RAW_AUDIO")) {
         raw_audio_mode = true;
-        if (force_raw_audio_mode) {
+        if (options->force_raw_audio_mode) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
                               "STREAM_RAW_AUDIO is deprecated and unnecessary when using uuid_raw_audio_stream. "
                               "Remove the channel variable; raw audio mode is already enabled by the API.\n");
@@ -1278,7 +1291,7 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
     }
 
     if (raw_audio_mode) {
-        const char *raw_audio_source = force_raw_audio_mode ? "API" : "deprecated channel variable";
+        const char *raw_audio_source = options->force_raw_audio_mode ? "API" : "deprecated channel variable";
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                           "Raw audio mode enabled via %s, bypassing JSON+base64 encoding.\n", raw_audio_source);
     }
@@ -1366,22 +1379,40 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
     }
     // The playback path replaces frames on the write side: resample to the write codec rate, which
     // can differ from the read rate on asymmetric sessions
-    uint32_t playback_target_rate = samples_per_second;
+    uint32_t playback_target_rate = options->capture_input_rate;
     switch_codec_t *write_codec = switch_core_session_get_write_codec(session);
     if (write_codec && write_codec->implementation) {
         playback_target_rate = write_codec->implementation->actual_samples_per_second;
     }
-    if (playback_target_rate != samples_per_second) {
+    if (playback_target_rate != options->capture_input_rate) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
                           "playback target rate %u differs from read rate %u\n", playback_target_rate,
-                          samples_per_second);
+                          options->capture_input_rate);
     }
 
-    if (SWITCH_STATUS_SUCCESS !=
-        stream_data_init(tech_pvt, session, wsUri, samples_per_second, playback_target_rate, sampling,
-                         playback_sampling, channels, responseHandler, deflate, heart_beat, suppressLog, rtp_packets,
-                         extra_headers, no_reconnect, tls_cafile, tls_keyfile, tls_certfile,
-                         tls_disable_hostname_validation, disable_audiofiles, start_muted, raw_audio_mode)) {
+    StreamConfig config{};
+    config.websocket_uri = options->websocket_uri;
+    config.capture_input_rate = options->capture_input_rate;
+    config.capture_output_rate = options->capture_output_rate;
+    config.playback_input_rate = options->playback_input_rate;
+    config.playback_output_rate = playback_target_rate;
+    config.channels = options->channels;
+    config.response_handler = responseHandler;
+    config.disable_per_message_deflate = deflate != 0;
+    config.heartbeat_seconds = heart_beat;
+    config.suppress_log = suppressLog;
+    config.capture_packet_count = rtp_packets;
+    config.extra_headers = extra_headers;
+    config.disable_reconnect = no_reconnect;
+    config.tls_ca_file = tls_cafile;
+    config.tls_key_file = tls_keyfile;
+    config.tls_cert_file = tls_certfile;
+    config.disable_tls_hostname_validation = tls_disable_hostname_validation;
+    config.disable_audio_files = disable_audiofiles;
+    config.start_muted = options->start_muted != SWITCH_FALSE;
+    config.raw_audio_mode = raw_audio_mode;
+
+    if (stream_data_init(tech_pvt, session, config) != SWITCH_STATUS_SUCCESS) {
         destroy_tech_pvt(tech_pvt);
         return SWITCH_STATUS_FALSE;
     }
