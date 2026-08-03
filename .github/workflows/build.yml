@@ -37,7 +37,7 @@ jobs:
             ${{ runner.os }}-ccache-${{ hashFiles('**/CMakeLists.txt', '**/*.cmake') }}-
             ${{ runner.os }}-ccache-
 
-      - name: Configure & Build
+      - name: Configure & Build with TLS
         run: |
           set -eux
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -45,3 +45,11 @@ jobs:
                 -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
                 -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build build --parallel "$(nproc)"
+
+      - name: Configure & Build without TLS
+        run: |
+          set -eux
+          cmake -S . -B build-no-tls -DCMAKE_BUILD_TYPE=Release -DUSE_TLS=OFF \
+                -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build-no-tls --parallel "$(nproc)"

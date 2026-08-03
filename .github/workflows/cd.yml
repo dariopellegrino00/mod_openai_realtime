@@ -31,6 +31,16 @@ jobs:
             exit 1
           fi
 
+      - name: Ensure tag matches project version
+        run: |
+          set -eu
+          project_version="$(tr -d '\r' < VERSION | head -n 1)"
+          expected_tag="v${project_version}"
+          if [ "$GITHUB_REF_NAME" != "$expected_tag" ]; then
+            echo "::error::Release tag $GITHUB_REF_NAME does not match VERSION ($project_version)."
+            exit 1
+          fi
+
   build:
     name: Validate build
     needs: validate_tag

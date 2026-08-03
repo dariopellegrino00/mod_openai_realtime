@@ -1,7 +1,7 @@
 cmake-build-debug/
 .idea/
 .vscode/
-build/
+build*/
 _packages
 test_tools/
 __pycache__/

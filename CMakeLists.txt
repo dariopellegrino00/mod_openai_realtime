@@ -1,14 +1,16 @@
 cmake_minimum_required(VERSION 3.18)
+
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" MOD_OPENAI_REALTIME_VERSION LIMIT_COUNT 1)
+if(NOT MOD_OPENAI_REALTIME_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "VERSION must contain a semantic version in MAJOR.MINOR.PATCH format")
+endif()
+
 project(mod_openai_audio_stream
-        VERSION 1.0.0
+        VERSION "${MOD_OPENAI_REALTIME_VERSION}"
         DESCRIPTION "Audio streaming module for FreeSWITCH."
-        HOMEPAGE_URL "https://github.com/VoiSmart/mod_openai_realtime") 
+        HOMEPAGE_URL "https://github.com/VoiSmart/mod_openai_realtime")
 
 include(GNUInstallDirs)
-
-set(CMAKE_CXX_STANDARD 11)
-set(CMAKE_SHARED_LIBRARY_PREFIX "")
-set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g")
 
 option(ENABLE_LOCAL "Enable local compile/debug specific" OFF)
 if(ENABLE_LOCAL)
@@ -18,21 +20,15 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 find_package(PkgConfig REQUIRED)
 find_package(SpeexDSP REQUIRED)
-find_package(OpenSSL REQUIRED)
-find_package(ZLIB REQUIRED)
+find_package(Threads REQUIRED)
 
 pkg_check_modules(FreeSWITCH REQUIRED IMPORTED_TARGET freeswitch)
 pkg_get_variable(FS_MOD_DIR freeswitch modulesdir)
 message(STATUS "FreeSWITCH modules dir: ${FS_MOD_DIR}")
 
-set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "Disable ixwebsocket installation" FORCE)
-set(USE_TLS ON CACHE BOOL "Use TLS for secure WebSocket connections" FORCE)
+set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "Disable ixwebsocket installation")
+option(USE_TLS "Use TLS for secure WebSocket connections" ON)
 add_subdirectory(libs/IXWebSocket)
-
-if(CMAKE_BUILD_TYPE MATCHES "Release")
-    # Add linker flags to strip symbols and reduce size of static library
-    set_target_properties(ixwebsocket PROPERTIES LINK_FLAGS_RELEASE "-s -w") #-static-libgcc -static-libstdc++
-endif()
 
 add_library(mod_openai_audio_stream SHARED
     mod_openai_audio_stream.c
@@ -44,7 +40,16 @@ add_library(mod_openai_audio_stream SHARED
     base64.cpp
 )
 
-set_property(TARGET mod_openai_audio_stream PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_target_properties(mod_openai_audio_stream PROPERTIES
+    PREFIX ""
+    POSITION_INDEPENDENT_CODE ON
+    C_EXTENSIONS ON
+    CXX_STANDARD 11
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS ON
+)
+
+target_compile_features(mod_openai_audio_stream PRIVATE c_std_99)
 
 target_include_directories(mod_openai_audio_stream PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/IXWebSocket
@@ -55,7 +60,7 @@ target_link_libraries(mod_openai_audio_stream PRIVATE
     PkgConfig::FreeSWITCH
     ${SPEEXDSP_LIBRARIES}
     ixwebsocket
-    pthread
+    Threads::Threads
 )
 
 install(TARGETS ${PROJECT_NAME}
