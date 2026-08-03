@@ -21,3 +21,9 @@ add_stream_test(test_base64
     test_base64.cpp
     ${MODULE_SOURCE_DIR}/base64.cpp
 )
+
+add_stream_test(test_playback_queue
+    test_playback_queue.cpp
+    ${MODULE_SOURCE_DIR}/playback_queue.cpp
+)
+target_link_libraries(test_playback_queue PRIVATE Threads::Threads)

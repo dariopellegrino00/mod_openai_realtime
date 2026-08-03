@@ -3,7 +3,6 @@
 #include "openai_audio_streamer_glue.h"
 #include <ixwebsocket/IXWebSocket.h>
 #include <sstream>
-#include <queue>
 #include <algorithm>
 #include <memory>
 #include <mutex>
@@ -17,6 +16,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "base64.h"
+#include "playback_queue.h"
 
 #include <cerrno>
 #include <fcntl.h>
@@ -78,10 +78,11 @@ class AudioStreamer {
   public:
     AudioStreamer(const char *session_id, const StreamConfig& config, private_t *context)
         : m_sessionId(session_id), m_notify(config.response_handler), m_suppress_log(config.suppress_log),
-          m_playFile(0), m_disable_audiofiles(config.disable_audio_files), m_raw_audio_mode(config.raw_audio_mode),
+          m_playFile(0), in_sample_rate(config.playback_input_rate), out_sample_rate(config.playback_output_rate),
+          m_playback_queue(static_cast<std::size_t>(config.playback_output_rate) * MAX_PLAYBACK_QUEUE_SECONDS,
+                           MAX_AUDIO_CHUNK_SAMPLES),
+          m_disable_audiofiles(config.disable_audio_files), m_raw_audio_mode(config.raw_audio_mode),
           m_context(context) {
-
-        in_sample_rate = config.playback_input_rate;
 
         ix::WebSocketHttpHeaders headers;
         ix::SocketTLSOptions tlsOptions;
@@ -163,7 +164,7 @@ class AudioStreamer {
                         auto converted = convertRawAudio(msg->str);
                         if (!converted.empty()) {
                             m_response_audio_done = false;
-                            push_audio_queue(converted);
+                            push_audio_queue(std::move(converted));
                         }
                     } else {
                         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
@@ -238,7 +239,6 @@ class AudioStreamer {
             }
         });
 
-        out_sample_rate = config.playback_output_rate;
         if (in_sample_rate != out_sample_rate) {
             int err = 0;
             m_resampler = speex_resampler_init(1, in_sample_rate, out_sample_rate, SWITCH_RESAMPLE_QUALITY, &err);
@@ -569,7 +569,7 @@ class AudioStreamer {
 
                     auto resampled = convertRawAudio(rawAudio);
                     if (!resampled.empty()) {
-                        push_audio_queue(resampled);
+                        push_audio_queue(std::move(resampled));
                         status = SWITCH_TRUE;
                     }
 
@@ -596,55 +596,22 @@ class AudioStreamer {
 
     // managing queue, check if empty before popping or peeking
 
-    void push_audio_queue(const std::vector<int16_t>& audio_data) {
-        std::lock_guard<std::mutex> lock(m_audio_queue_mutex);
-        const size_t total = audio_data.size();
-        if (m_audio_queue_samples + total > max_playback_queue_samples()) {
-            if (!m_queue_overflow_logged) {
-                m_queue_overflow_logged = true;
-                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                                  "(%s) push_audio_queue: playback backlog exceeds %d seconds, dropping incoming "
-                                  "audio until it drains\n",
-                                  m_sessionId.c_str(), MAX_PLAYBACK_QUEUE_SECONDS);
-            }
-            return;
+    void push_audio_queue(std::vector<int16_t> audio_data) {
+        const auto result = m_playback_queue.push(std::move(audio_data));
+        if (result == audio_stream::PlaybackQueue::PushResult::OverflowStarted) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                              "(%s) push_audio_queue: playback queue reached its %d-second capacity; dropping "
+                              "incoming audio that does not fit\n",
+                              m_sessionId.c_str(), MAX_PLAYBACK_QUEUE_SECONDS);
         }
-        if (total <= MAX_AUDIO_CHUNK_SAMPLES) {
-            m_audio_queue.push(audio_data);
-        } else {
-            size_t num_chunks = (total + MAX_AUDIO_CHUNK_SAMPLES - 1) / MAX_AUDIO_CHUNK_SAMPLES;
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
-                              "(%s) push_audio_queue: re-chunking %zu samples into %zu chunks (max %d samples each)\n",
-                              m_sessionId.c_str(), total, num_chunks, MAX_AUDIO_CHUNK_SAMPLES);
-            for (size_t offset = 0; offset < total; offset += MAX_AUDIO_CHUNK_SAMPLES) {
-                size_t end = std::min(offset + MAX_AUDIO_CHUNK_SAMPLES, total);
-                m_audio_queue.emplace(audio_data.begin() + offset, audio_data.begin() + end);
-            }
-        }
-        m_audio_queue_samples += total;
     }
 
     bool pop_audio_queue(std::vector<int16_t>& out_audio) {
-        std::lock_guard<std::mutex> lock(m_audio_queue_mutex);
-        if (m_audio_queue.empty()) {
-            return false;
-        }
-        out_audio = std::move(m_audio_queue.front());
-        m_audio_queue.pop();
-        m_audio_queue_samples -= out_audio.size();
-        if (m_queue_overflow_logged && m_audio_queue_samples < max_playback_queue_samples() / 2) {
-            m_queue_overflow_logged = false;
-        }
-        return true;
+        return m_playback_queue.pop(out_audio);
     }
 
     void clear_audio_queue() {
-        std::lock_guard<std::mutex> lock(m_audio_queue_mutex);
-        while (!m_audio_queue.empty()) {
-            m_audio_queue.pop();
-        }
-        m_audio_queue_samples = 0;
-        m_queue_overflow_logged = false;
+        m_playback_queue.clear();
     }
 
     ~AudioStreamer() {
@@ -802,10 +769,6 @@ class AudioStreamer {
     }
 
   private:
-    size_t max_playback_queue_samples() const {
-        return static_cast<size_t>(out_sample_rate) * MAX_PLAYBACK_QUEUE_SECONDS;
-    }
-
     std::string m_sessionId;
     responseHandler_t m_notify;
     ix::WebSocket webSocket;
@@ -816,10 +779,7 @@ class AudioStreamer {
     int in_sample_rate = 24000;  // playback sample rate (default: OpenAI 24kHz)
     int out_sample_rate = 16000; // output default sample rate
     SpeexResamplerState *m_resampler = nullptr;
-    std::queue<std::vector<int16_t>> m_audio_queue;
-    std::mutex m_audio_queue_mutex;
-    size_t m_audio_queue_samples = 0;     // guarded by m_audio_queue_mutex
-    bool m_queue_overflow_logged = false; // guarded by m_audio_queue_mutex
+    audio_stream::PlaybackQueue m_playback_queue;
     std::atomic<uint64_t> m_playback_clear_gen{0};
     uint64_t m_playback_clear_gen_seen = 0; // media (write_frame) thread only
     bool m_disable_audiofiles = false;      // disable saving audio files if true
