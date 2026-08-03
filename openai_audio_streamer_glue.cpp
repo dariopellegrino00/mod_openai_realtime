@@ -111,10 +111,7 @@ class AudioStreamer {
 
         webSocket.setUrl(config.websocket_uri);
 
-        // Setup eventual TLS options.
-        // tls_cafile may hold the special values
-        // NONE, which disables validation and SYSTEM which uses
-        // the system CAs bundle
+        // NONE disables certificate validation; SYSTEM selects the platform CA bundle.
         if (config.tls_ca_file) {
             tlsOptions.caFile = config.tls_ca_file;
         }
@@ -146,98 +143,8 @@ class AudioStreamer {
         if (config.disable_reconnect)
             webSocket.disableAutomaticReconnection();
 
-        // Setup a callback to be fired when a message or an event (open, close, error) is received
-        webSocket.setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
-            if (msg->type == ix::WebSocketMessageType::Message) {
-                if (msg->str.size() > MAX_WS_MESSAGE_BYTES) {
-                    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                                      "(%s) Dropping oversized %s WebSocket message (%zu bytes, max %d)\n",
-                                      m_sessionId.c_str(), msg->binary ? "binary" : "text", msg->str.size(),
-                                      MAX_WS_MESSAGE_BYTES);
-                    return;
-                }
-                if (msg->binary) {
-                    if (m_raw_audio_mode) {
-                        if (!m_disable_audiofiles) {
-                            saveDebugAudioFile(msg->str, true);
-                        }
-                        auto converted = convertRawAudio(msg->str);
-                        if (!converted.empty()) {
-                            m_response_audio_done = false;
-                            push_audio_queue(std::move(converted));
-                        }
-                    } else {
-                        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                                          "(%s) Received binary WebSocket frame (%zu bytes) but raw audio mode is not "
-                                          "enabled, ignoring\n",
-                                          m_sessionId.c_str(), msg->str.size());
-                    }
-                } else {
-                    eventCallback(MESSAGE, msg->str.c_str());
-                }
-
-            } else if (msg->type == ix::WebSocketMessageType::Open) {
-                // A new connection starts a new PCM stream: forget any half-sample carried over
-                m_has_pending_raw_byte = false;
-
-                // On OOM the event is still fired, just without a JSON body
-                cJSON *root = cJSON_CreateObject();
-                char *json_str = nullptr;
-                if (root) {
-                    cJSON_AddStringToObject(root, "status", "connected");
-                    json_str = cJSON_PrintUnformatted(root);
-                }
-
-                eventCallback(CONNECT_SUCCESS, json_str);
-
-                cJSON_Delete(root);
-                switch_safe_free(json_str);
-
-            } else if (msg->type == ix::WebSocketMessageType::Error) {
-                // A message will be fired when there is an error with the connection. The message type will be
-                // ix::WebSocketMessageType::Error.
-                //  Multiple fields will be inuse on the event to describe the error.
-                cJSON *root = cJSON_CreateObject();
-                char *json_str = nullptr;
-                if (root) {
-                    cJSON_AddStringToObject(root, "status", "error");
-                    cJSON *message = cJSON_CreateObject();
-                    if (message) {
-                        cJSON_AddNumberToObject(message, "retries", msg->errorInfo.retries);
-                        cJSON_AddStringToObject(message, "error", msg->errorInfo.reason.c_str());
-                        cJSON_AddNumberToObject(message, "wait_time", msg->errorInfo.wait_time);
-                        cJSON_AddNumberToObject(message, "http_status", msg->errorInfo.http_status);
-                        cJSON_AddItemToObject(root, "message", message);
-                    }
-                    json_str = cJSON_PrintUnformatted(root);
-                }
-
-                eventCallback(CONNECT_ERROR, json_str);
-
-                cJSON_Delete(root);
-                switch_safe_free(json_str);
-            } else if (msg->type == ix::WebSocketMessageType::Close) {
-                // The server can send an explicit code and reason for closing.
-                // This data can be accessed through the closeInfo object.
-                cJSON *root = cJSON_CreateObject();
-                char *json_str = nullptr;
-                if (root) {
-                    cJSON_AddStringToObject(root, "status", "disconnected");
-                    cJSON *message = cJSON_CreateObject();
-                    if (message) {
-                        cJSON_AddNumberToObject(message, "code", msg->closeInfo.code);
-                        cJSON_AddStringToObject(message, "reason", msg->closeInfo.reason.c_str());
-                        cJSON_AddItemToObject(root, "message", message);
-                    }
-                    json_str = cJSON_PrintUnformatted(root);
-                }
-
-                eventCallback(CONNECTION_DROPPED, json_str);
-
-                cJSON_Delete(root);
-                switch_safe_free(json_str);
-            }
-        });
+        webSocket.setOnMessageCallback(
+            [this](const ix::WebSocketMessagePtr& message) { handleWebSocketMessage(message); });
 
         if (in_sample_rate != out_sample_rate) {
             int err = 0;
@@ -249,12 +156,109 @@ class AudioStreamer {
                                   in_sample_rate, out_sample_rate, speex_resampler_strerror(err));
             }
         }
+    }
 
-        // The WebSocket starts only after the media bug and channel private have been published.
-        // This closes the startup window where callbacks could not find their own session context.
+    void handleWebSocketMessage(const ix::WebSocketMessagePtr& message) {
+        switch (message->type) {
+            case ix::WebSocketMessageType::Message:
+                handleDataMessage(message);
+                break;
+            case ix::WebSocketMessageType::Open:
+                handleConnectionOpen();
+                break;
+            case ix::WebSocketMessageType::Error:
+                handleConnectionError(message->errorInfo);
+                break;
+            case ix::WebSocketMessageType::Close:
+                handleConnectionClose(message->closeInfo);
+                break;
+            default:
+                break;
+        }
+    }
+
+    void handleDataMessage(const ix::WebSocketMessagePtr& message) {
+        if (message->str.size() > MAX_WS_MESSAGE_BYTES) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                              "(%s) Dropping oversized %s WebSocket message (%zu bytes, max %d)\n", m_sessionId.c_str(),
+                              message->binary ? "binary" : "text", message->str.size(), MAX_WS_MESSAGE_BYTES);
+            return;
+        }
+
+        if (!message->binary) {
+            eventCallback(MESSAGE, message->str.c_str());
+            return;
+        }
+
+        if (!m_raw_audio_mode) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                              "(%s) Received binary WebSocket frame (%zu bytes) but raw audio mode is not enabled, "
+                              "ignoring\n",
+                              m_sessionId.c_str(), message->str.size());
+            return;
+        }
+
+        if (!m_disable_audiofiles) {
+            saveDebugAudioFile(message->str, true);
+        }
+        auto converted = convertRawAudio(message->str);
+        if (!converted.empty()) {
+            m_response_audio_done = false;
+            push_audio_queue(std::move(converted));
+        }
+    }
+
+    void handleConnectionOpen() {
+        // A new connection starts a new PCM stream: forget any half-sample carried over.
+        m_has_pending_raw_byte = false;
+
+        cJSON *root = cJSON_CreateObject();
+        if (root) {
+            cJSON_AddStringToObject(root, "status", "connected");
+        }
+        dispatchConnectionEvent(CONNECT_SUCCESS, root);
+    }
+
+    void handleConnectionError(const ix::WebSocketErrorInfo& error) {
+        cJSON *root = cJSON_CreateObject();
+        if (root) {
+            cJSON_AddStringToObject(root, "status", "error");
+            cJSON *message = cJSON_CreateObject();
+            if (message) {
+                cJSON_AddNumberToObject(message, "retries", error.retries);
+                cJSON_AddStringToObject(message, "error", error.reason.c_str());
+                cJSON_AddNumberToObject(message, "wait_time", error.wait_time);
+                cJSON_AddNumberToObject(message, "http_status", error.http_status);
+                cJSON_AddItemToObject(root, "message", message);
+            }
+        }
+        dispatchConnectionEvent(CONNECT_ERROR, root);
+    }
+
+    void handleConnectionClose(const ix::WebSocketCloseInfo& close) {
+        cJSON *root = cJSON_CreateObject();
+        if (root) {
+            cJSON_AddStringToObject(root, "status", "disconnected");
+            cJSON *message = cJSON_CreateObject();
+            if (message) {
+                cJSON_AddNumberToObject(message, "code", close.code);
+                cJSON_AddStringToObject(message, "reason", close.reason.c_str());
+                cJSON_AddItemToObject(root, "message", message);
+            }
+        }
+        dispatchConnectionEvent(CONNECTION_DROPPED, root);
+    }
+
+    void dispatchConnectionEvent(notifyEvent_t event, cJSON *payload) {
+        // Takes ownership of payload. On OOM the event is still fired without a JSON body.
+        char *json = payload ? cJSON_PrintUnformatted(payload) : nullptr;
+        eventCallback(event, json);
+        cJSON_Delete(payload);
+        switch_safe_free(json);
     }
 
     bool start() {
+        // start_capture publishes the media bug and channel private before callbacks can run.
         try {
             webSocket.start();
             m_started = true;
@@ -305,7 +309,7 @@ class AudioStreamer {
                     }
 
                     break;
-                case MESSAGE:
+                case MESSAGE: {
                     std::string msg(message);
                     if (processMessage(psession, msg) != SWITCH_TRUE) {
                         m_notify(psession, EVENT_JSON, msg.c_str());
@@ -316,6 +320,7 @@ class AudioStreamer {
                                           "Received message: %s\n", msg.c_str());
                     }
                     break;
+                }
             }
             switch_core_session_rwunlock(psession);
         }
@@ -343,8 +348,7 @@ class AudioStreamer {
         if (size == 0) {
             return {};
         }
-        size_t usable_bytes = size;
-        size_t in_samples = usable_bytes / 2;
+        size_t in_samples = size / 2;
 
         if (!m_resampler) {
             if (in_sample_rate != out_sample_rate) {
@@ -353,7 +357,7 @@ class AudioStreamer {
                 return {};
             }
             std::vector<int16_t> buffer(in_samples);
-            std::memcpy(buffer.data(), data, usable_bytes);
+            std::memcpy(buffer.data(), data, size);
             return buffer;
         }
 
@@ -369,7 +373,7 @@ class AudioStreamer {
         std::vector<int16_t> in_buffer(in_samples);
         std::vector<int16_t> out_buffer(out_samples);
 
-        std::memcpy(in_buffer.data(), data, usable_bytes);
+        std::memcpy(in_buffer.data(), data, size);
 
         spx_uint32_t in_len = static_cast<spx_uint32_t>(in_samples);
         spx_uint32_t out_len = static_cast<spx_uint32_t>(out_samples);
@@ -378,39 +382,32 @@ class AudioStreamer {
 
         if (err != RESAMPLER_ERR_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Resampling failed with error code: %d\n", err);
-            return {}; // empty on error
+            return {};
         }
 
-        out_buffer.resize(out_len); // resize to actual resampled size
+        out_buffer.resize(out_len);
         return out_buffer;
     }
 
-    // create wav file from raw audio
-    // rawAudio passed as constant reference because it is never edited
-    // Note: the header multi-byte fields and PCM samples are written host-endian; this debug
-    // helper assumes a little-endian host, which matches all supported deployment platforms.
+    // WAV fields and PCM samples use host byte order; supported deployments are little-endian.
     std::string createWavFromRaw(const std::string& rawAudio) {
+        const uint16_t numChannels = 1;
+        const uint16_t bitsPerSample = 16;
+        const uint16_t audioFormat = 1;
+        const uint32_t formatChunkSize = 16;
+        const uint32_t byteRate = in_sample_rate * numChannels * bitsPerSample / 8;
+        const uint16_t blockAlign = numChannels * bitsPerSample / 8;
+        const uint32_t dataSize = static_cast<uint32_t>(rawAudio.size());
+        const uint32_t chunkSize = 36 + dataSize;
 
-        const int numChannels = 1;    // mono
-        const int bitsPerSample = 16; // pcm16
-        int byteRate = in_sample_rate * numChannels * bitsPerSample / 8;
-        int blockAlign = numChannels * bitsPerSample / 8;
-        uint32_t dataSize = static_cast<uint32_t>(rawAudio.size());
-        uint32_t chunkSize = 36 + dataSize;
+        std::ostringstream wavStream;
 
-        std::ostringstream wavStream; // write in string like stream
-
-        // creating wav header
-        // riff header
-        wavStream.write("RIFF", 4);                                     // chunk id
-        wavStream.write(reinterpret_cast<const char *>(&chunkSize), 4); // chunk Size
+        wavStream.write("RIFF", 4);
+        wavStream.write(reinterpret_cast<const char *>(&chunkSize), 4);
         wavStream.write("WAVE", 4);
 
-        // this subchunk contains format infos
         wavStream.write("fmt ", 4);
-        uint32_t subchunk1Size = 16;
-        wavStream.write(reinterpret_cast<const char *>(&subchunk1Size), 4);
-        uint16_t audioFormat = 1; // 1 is pcm
+        wavStream.write(reinterpret_cast<const char *>(&formatChunkSize), 4);
         wavStream.write(reinterpret_cast<const char *>(&audioFormat), 2);
         wavStream.write(reinterpret_cast<const char *>(&numChannels), 2);
         wavStream.write(reinterpret_cast<const char *>(&in_sample_rate), 4);
@@ -418,7 +415,6 @@ class AudioStreamer {
         wavStream.write(reinterpret_cast<const char *>(&blockAlign), 2);
         wavStream.write(reinterpret_cast<const char *>(&bitsPerSample), 2);
 
-        // data subchunk contains audio data
         wavStream.write("data", 4);
         wavStream.write(reinterpret_cast<const char *>(&dataSize), 4);
         wavStream.write(rawAudio.data(), dataSize);
@@ -462,8 +458,11 @@ class AudioStreamer {
         }
         close(fd);
 
-        switch_core_session_t *psession = switch_core_session_locate(m_sessionId.c_str());
-        if (notifyPlaybackEvent && psession) {
+        if (notifyPlaybackEvent) {
+            switch_core_session_t *psession = switch_core_session_locate(m_sessionId.c_str());
+            if (!psession) {
+                return filePath;
+            }
             cJSON *payload = cJSON_CreateObject();
             if (payload) {
                 cJSON_AddStringToObject(payload, "file", filePath.c_str());
@@ -474,127 +473,118 @@ class AudioStreamer {
                 }
                 cJSON_Delete(payload);
             }
-        }
-        if (psession) {
             switch_core_session_rwunlock(psession);
         }
 
         return filePath;
     }
 
+    void handleSpeechStarted(switch_core_session_t *session) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                          "(%s) processMessage - user speech started, stopping openai audio playback\n",
+                          m_sessionId.c_str());
+        m_playback_queue.clear();
+        request_playback_clear();
+    }
+
+    switch_bool_t handleAudioDelta(switch_core_session_t *session, cJSON *json, std::string& message) {
+        const char *json_audio = cJSON_GetObjectCstr(json, "delta");
+        m_response_audio_done = false;
+        if (!json_audio || *json_audio == '\0') {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "(%s) processMessage - response.output_audio.delta no audio data\n", m_sessionId.c_str());
+            return SWITCH_FALSE;
+        }
+
+        std::string raw_audio;
+        try {
+            raw_audio = base64_decode(json_audio);
+        } catch (const std::exception& e) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "(%s) processMessage - base64 decode error: %s\n", m_sessionId.c_str(), e.what());
+            return SWITCH_FALSE;
+        }
+
+        // The audio payload was already decoded: strip the base64 from the copies used for
+        // events and logs (the README documents EVENT_PLAY as replacing it with the file path).
+        cJSON_DeleteItemFromObject(json, "delta");
+
+        bool notify_play = false;
+        if (!m_disable_audiofiles) {
+            const std::string file_path = saveDebugAudioFile(raw_audio);
+            if (!file_path.empty()) {
+                cJSON *json_file = cJSON_CreateString(file_path.c_str());
+                if (json_file) {
+                    cJSON_AddItemToObject(json, "file", json_file);
+                    notify_play = true;
+                }
+            }
+        }
+
+        char *serialized = cJSON_PrintUnformatted(json);
+        if (serialized) {
+            if (notify_play) {
+                m_notify(session, EVENT_PLAY, serialized);
+            }
+            message.assign(serialized);
+            free(serialized);
+        }
+
+        auto resampled = convertRawAudio(raw_audio);
+        if (resampled.empty()) {
+            return SWITCH_FALSE;
+        }
+        push_audio_queue(std::move(resampled));
+        return SWITCH_TRUE;
+    }
+
     switch_bool_t processMessage(switch_core_session_t *session, std::string& message) {
-        switch_bool_t status = SWITCH_FALSE;
         if (stream_protocol::json_depth_exceeded(message.c_str(), MAX_JSON_DEPTH)) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                               "(%s) processMessage - dropping JSON nested deeper than %d levels\n", m_sessionId.c_str(),
                               MAX_JSON_DEPTH);
-            // report as handled so the raw payload is not forwarded to event subscribers
-            return SWITCH_TRUE;
+            return SWITCH_TRUE; // handled: do not forward the untrusted payload
         }
+
         cJSON *json = cJSON_Parse(message.c_str());
         if (!json) {
-            return status;
+            return SWITCH_FALSE;
         }
 
-        const char *jsType = cJSON_GetObjectCstr(json, "type");
+        switch_bool_t status = SWITCH_FALSE;
+        const char *json_type = cJSON_GetObjectCstr(json, "type");
         if (!m_suppress_log) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "processMessage type: %s\n",
-                              jsType ? jsType : "null");
-        }
-        if (!jsType) {
-            cJSON_Delete(json);
-            return status;
+                              json_type ? json_type : "null");
         }
 
-        switch (stream_protocol::classify_json_message(jsType)) {
+        switch (stream_protocol::classify_json_message(json_type)) {
             case stream_protocol::JsonMessageType::Error:
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                                   "(%s) processMessage - error: %s\n", m_sessionId.c_str(), message.c_str());
                 break;
-
             case stream_protocol::JsonMessageType::SpeechStarted:
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-                                  "(%s) processMessage - user speech started, stopping openai audio playback\n",
-                                  m_sessionId.c_str());
-                clear_audio_queue();
-                // also clear the private_t playback buffer used in write frame
-                request_playback_clear();
+                handleSpeechStarted(session);
                 break;
-
             case stream_protocol::JsonMessageType::SpeechStopped:
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                                   "(%s) processMessage - user speech stopped\n", m_sessionId.c_str());
                 break;
-
-            case stream_protocol::JsonMessageType::AudioDelta: {
-                const char *jsonAudio = cJSON_GetObjectCstr(json, "delta");
-                m_response_audio_done = false;
-
-                if (jsonAudio && strlen(jsonAudio) > 0) {
-                    std::string rawAudio;
-                    try {
-                        rawAudio = base64_decode(jsonAudio);
-                    } catch (const std::exception& e) {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                          "(%s) processMessage - base64 decode error: %s\n", m_sessionId.c_str(),
-                                          e.what());
-                        cJSON_Delete(json);
-                        return status;
-                    }
-
-                    // The audio payload was already decoded: strip the base64 from the copies used for
-                    // events and logs (the README documents EVENT_PLAY as replacing it with the file path)
-                    cJSON_DeleteItemFromObject(json, "delta");
-
-                    bool notify_play = false;
-                    if (!m_disable_audiofiles) {
-                        std::string filePath = saveDebugAudioFile(rawAudio);
-                        if (!filePath.empty()) {
-                            cJSON *jsonFile = cJSON_CreateString(filePath.c_str());
-                            if (jsonFile) {
-                                cJSON_AddItemToObject(json, "file", jsonFile);
-                                notify_play = true;
-                            }
-                        }
-                    }
-
-                    char *jsonString = cJSON_PrintUnformatted(json);
-                    if (jsonString) {
-                        if (notify_play) {
-                            m_notify(session, EVENT_PLAY, jsonString);
-                        }
-                        message.assign(jsonString);
-                        free(jsonString);
-                    }
-
-                    auto resampled = convertRawAudio(rawAudio);
-                    if (!resampled.empty()) {
-                        push_audio_queue(std::move(resampled));
-                        status = SWITCH_TRUE;
-                    }
-
-                } else {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                      "(%s) processMessage - response.output_audio.delta no audio data\n",
-                                      m_sessionId.c_str());
-                }
+            case stream_protocol::JsonMessageType::AudioDelta:
+                status = handleAudioDelta(session, json, message);
                 break;
-            }
-
             case stream_protocol::JsonMessageType::AudioDone:
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
                                   "(%s) processMessage - audio done\n", m_sessionId.c_str());
                 m_response_audio_done = true;
                 break;
-
             case stream_protocol::JsonMessageType::Unhandled:
                 break;
         }
+
         cJSON_Delete(json);
         return status;
     }
-
-    // managing queue, check if empty before popping or peeking
 
     void push_audio_queue(std::vector<int16_t> audio_data) {
         const auto result = m_playback_queue.push(std::move(audio_data));
@@ -608,10 +598,6 @@ class AudioStreamer {
 
     bool pop_audio_queue(std::vector<int16_t>& out_audio) {
         return m_playback_queue.pop(out_audio);
-    }
-
-    void clear_audio_queue() {
-        m_playback_queue.clear();
     }
 
     ~AudioStreamer() {
@@ -635,16 +621,15 @@ class AudioStreamer {
         }
     }
 
-    bool isConnected() {
+    bool isConnected() const {
         return (webSocket.getReadyState() == ix::ReadyState::Open);
     }
 
     // For all write methods, success means the payload was accepted by the WebSocket client while
     // connected; delivery to the server is not confirmed.
     bool writeAudioDelta(const uint8_t *buffer, size_t len) {
-        if (!this->isConnected())
+        if (!isConnected())
             return false;
-        // Convert the buffer to PCM16 and then base64 encode it.
 
         std::string base64Audio = base64_encode(buffer, len, false);
         if (base64Audio.empty())
@@ -663,7 +648,7 @@ class AudioStreamer {
     }
 
     bool writeBinary(const uint8_t *buffer, size_t len) {
-        if (!this->isConnected())
+        if (!isConnected())
             return false;
         return webSocket.sendBinary(ix::IXWebSocketSendData(reinterpret_cast<const char *>(buffer), len)).success;
     }
@@ -683,17 +668,15 @@ class AudioStreamer {
         return sent;
     }
 
-    bool writeText(const char *text) { // Openai only accepts json not utf8 plain text
-        if (!this->isConnected())
+    bool writeText(const char *text) {
+        if (!isConnected())
             return false;
         return webSocket.sendUtf8Text(ix::IXWebSocketSendData(text, strlen(text))).success;
     }
 
     void deleteFiles() {
-        if (m_playFile > 0) {
-            for (const auto& fileName : m_Files) {
-                remove(fileName.c_str());
-            }
+        for (const auto& fileName : m_Files) {
+            remove(fileName.c_str());
         }
     }
 
@@ -720,7 +703,7 @@ class AudioStreamer {
         return true;
     }
 
-    bool is_openai_speaking() {
+    bool is_openai_speaking() const {
         return m_openai_speaking;
     }
 
@@ -728,11 +711,11 @@ class AudioStreamer {
         return m_suppress_log;
     }
 
-    bool is_response_audio_done() {
+    bool is_response_audio_done() const {
         return m_response_audio_done;
     }
 
-    bool is_terminally_closed() {
+    bool is_terminally_closed() const {
         return m_terminal_close;
     }
 
@@ -776,8 +759,8 @@ class AudioStreamer {
     int m_playFile;
     std::unordered_set<std::string> m_Files;
 
-    int in_sample_rate = 24000;  // playback sample rate (default: OpenAI 24kHz)
-    int out_sample_rate = 16000; // output default sample rate
+    int in_sample_rate = 24000;
+    int out_sample_rate = 16000;
     SpeexResamplerState *m_resampler = nullptr;
     audio_stream::PlaybackQueue m_playback_queue;
     std::atomic<uint64_t> m_playback_clear_gen{0};
@@ -991,6 +974,40 @@ void flush_capture_residue(private_t *tech_pvt) {
     switch_buffer_zero(tech_pvt->sbuffer);
 }
 
+struct SessionContext {
+    switch_media_bug_t *bug;
+    private_t *data;
+};
+
+bool find_session_context(switch_core_session_t *session, const char *operation, SessionContext& context) {
+    if (!session) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "%s failed: no session found.\n", operation);
+        return false;
+    }
+
+    switch_channel_t *channel = switch_core_session_get_channel(session);
+    if (!channel) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "%s failed: no channel found.\n",
+                          operation);
+        return false;
+    }
+
+    context.bug = static_cast<switch_media_bug_t *>(switch_channel_get_private(channel, MY_BUG_NAME));
+    if (!context.bug) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "%s failed: no media bug found.\n",
+                          operation);
+        return false;
+    }
+
+    context.data = static_cast<private_t *>(switch_core_media_bug_get_user_data(context.bug));
+    if (!context.data) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                          "%s failed: session data is unavailable.\n", operation);
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 extern "C" {
@@ -1011,25 +1028,16 @@ switch_status_t is_valid_utf8(const char *str) {
 }
 
 switch_status_t stream_session_send_json(switch_core_session_t *session, const char *base64_input) {
-    switch_channel_t *channel = switch_core_session_get_channel(session);
-    auto *bug = static_cast<switch_media_bug_t *>(switch_channel_get_private(channel, MY_BUG_NAME));
-    cJSON *json_obj = nullptr;
-    char *json_unformatted = nullptr;
-    switch_status_t status = SWITCH_STATUS_FALSE;
-    if (!bug) {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                          "stream_session_send_json failed: no media bug found.\n");
+    SessionContext context{};
+    if (!find_session_context(session, "stream_session_send_json", context)) {
         return SWITCH_STATUS_FALSE;
     }
 
-    auto *tech_pvt = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
-    if (!tech_pvt) {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                          "stream_session_send_json failed to retrieve session data.\n");
-        return SWITCH_STATUS_FALSE;
-    }
-    AudioStreamer *pAudioStreamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
-    if (!pAudioStreamer) {
+    cJSON *json_obj = nullptr;
+    char *json_unformatted = nullptr;
+    switch_status_t status = SWITCH_STATUS_FALSE;
+    AudioStreamer *streamer = static_cast<AudioStreamer *>(context.data->pAudioStreamer);
+    if (!streamer) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "stream_session_send_json failed: AudioStreamer websocket is null.\n");
         return SWITCH_STATUS_FALSE;
@@ -1071,11 +1079,11 @@ switch_status_t stream_session_send_json(switch_core_session_t *session, const c
     }
 
     // The payload can carry sensitive data (instructions, base64 audio): honor STREAM_SUPPRESS_LOG
-    if (!pAudioStreamer->suppress_log()) {
+    if (!streamer->suppress_log()) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
                           "stream_session_send_json: sending JSON: %s\n", json_unformatted);
     }
-    status = pAudioStreamer->writeText(json_unformatted) ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+    status = streamer->writeText(json_unformatted) ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
 
     if (json_unformatted)
         free(json_unformatted);
@@ -1085,39 +1093,26 @@ switch_status_t stream_session_send_json(switch_core_session_t *session, const c
 }
 
 switch_status_t stream_session_pauseresume(switch_core_session_t *session, int pause) {
-    switch_channel_t *channel = switch_core_session_get_channel(session);
-    auto *bug = static_cast<switch_media_bug_t *>(switch_channel_get_private(channel, MY_BUG_NAME));
-    if (!bug) {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                          "stream_session_pauseresume failed because no bug\n");
+    SessionContext context{};
+    if (!find_session_context(session, "stream_session_pauseresume", context)) {
         return SWITCH_STATUS_FALSE;
     }
-    auto *tech_pvt = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
 
-    if (!tech_pvt)
-        return SWITCH_STATUS_FALSE;
-
-    switch_core_media_bug_flush(bug);
-    switch_atomic_set(&tech_pvt->audio_paused, pause ? 1 : 0);
+    switch_core_media_bug_flush(context.bug);
+    switch_atomic_set(&context.data->audio_paused, pause ? 1 : 0);
     return SWITCH_STATUS_SUCCESS;
 }
 
 switch_status_t stream_session_set_user_mute(switch_core_session_t *session, int mute) {
-    switch_channel_t *channel = switch_core_session_get_channel(session);
-    auto *bug = static_cast<switch_media_bug_t *>(switch_channel_get_private(channel, MY_BUG_NAME));
+    SessionContext context{};
     switch_status_t status = SWITCH_STATUS_FALSE;
-    if (!bug) {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                          "stream_session_set_user_mute failed because no bug\n");
+    if (!find_session_context(session, "stream_session_set_user_mute", context)) {
         return status;
     }
-    auto *tech_pvt = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
-    if (!tech_pvt) {
-        return status;
-    }
+    private_t *tech_pvt = context.data;
 
     status = SWITCH_STATUS_SUCCESS;
-    switch_core_media_bug_flush(bug);
+    switch_core_media_bug_flush(context.bug);
     const uint32_t new_state = mute ? 1 : 0;
     const uint32_t last_state = switch_atomic_read(&tech_pvt->user_audio_muted);
     switch_atomic_set(&tech_pvt->user_audio_muted, new_state);
@@ -1165,20 +1160,13 @@ switch_status_t stream_session_set_user_mute(switch_core_session_t *session, int
 }
 
 switch_status_t stream_session_set_openai_mute(switch_core_session_t *session, int mute) {
-    switch_channel_t *channel = switch_core_session_get_channel(session);
-    auto *bug = static_cast<switch_media_bug_t *>(switch_channel_get_private(channel, MY_BUG_NAME));
-    if (!bug) {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                          "stream_session_set_openai_mute failed because no bug\n");
+    SessionContext context{};
+    if (!find_session_context(session, "stream_session_set_openai_mute", context)) {
         return SWITCH_STATUS_FALSE;
     }
+    private_t *tech_pvt = context.data;
 
-    auto *tech_pvt = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
-    if (!tech_pvt) {
-        return SWITCH_STATUS_FALSE;
-    }
-
-    switch_core_media_bug_flush(bug);
+    switch_core_media_bug_flush(context.bug);
     const uint32_t new_state = mute ? 1 : 0;
     const uint32_t last_state = switch_atomic_read(&tech_pvt->openai_audio_muted);
     switch_atomic_set(&tech_pvt->openai_audio_muted, new_state);

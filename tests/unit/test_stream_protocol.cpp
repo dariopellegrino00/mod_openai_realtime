@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -29,6 +30,7 @@ void test_json_depth_limit() {
     CHECK(!stream_protocol::json_depth_exceeded(R"({"text":"escaped quote: \" and brace: {"})", 1));
     CHECK(!stream_protocol::json_depth_exceeded("{}", 1));
     CHECK(stream_protocol::json_depth_exceeded("{}", 0));
+    CHECK(stream_protocol::json_depth_exceeded("]] [[[", 2));
     CHECK(stream_protocol::json_depth_exceeded(nullptr, 1));
     CHECK(stream_protocol::json_depth_exceeded("{}", -1));
 }
@@ -75,6 +77,17 @@ void test_invalid_websocket_uris() {
     CHECK(!stream_protocol::validate_ws_uri("ws://localhost", nullptr, sizeof(destination)));
 }
 
+void test_uri_destination_size_boundary() {
+    const std::string uri = "wss://example.test/path";
+    std::vector<char> exact(uri.size() + 1, 'x');
+    CHECK(stream_protocol::validate_ws_uri(uri.c_str(), exact.data(), exact.size()));
+    CHECK(std::strcmp(exact.data(), uri.c_str()) == 0);
+
+    std::vector<char> too_small(uri.size(), 'x');
+    CHECK(!stream_protocol::validate_ws_uri(uri.c_str(), too_small.data(), too_small.size()));
+    CHECK(too_small == std::vector<char>(uri.size(), 'x'));
+}
+
 void test_utf8_validation() {
     CHECK(stream_protocol::is_valid_utf8(""));
     CHECK(stream_protocol::is_valid_utf8("plain ASCII"));
@@ -108,6 +121,7 @@ int main() {
     failures += run_test("JSON depth limit", test_json_depth_limit);
     failures += run_test("valid WebSocket URIs", test_valid_websocket_uris);
     failures += run_test("invalid WebSocket URIs", test_invalid_websocket_uris);
+    failures += run_test("WebSocket URI destination boundary", test_uri_destination_size_boundary);
     failures += run_test("UTF-8 validation", test_utf8_validation);
     return failures == 0 ? 0 : 1;
 }
