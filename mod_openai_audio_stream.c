@@ -7,11 +7,9 @@
 #include <strings.h>
 
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_openai_audio_stream_shutdown);
-SWITCH_MODULE_RUNTIME_FUNCTION(mod_openai_audio_stream_runtime);
 SWITCH_MODULE_LOAD_FUNCTION(mod_openai_audio_stream_load);
 
-SWITCH_MODULE_DEFINITION(mod_openai_audio_stream, mod_openai_audio_stream_load, mod_openai_audio_stream_shutdown,
-                         NULL /*mod_openai_audio_stream_runtime*/);
+SWITCH_MODULE_DEFINITION(mod_openai_audio_stream, mod_openai_audio_stream_load, mod_openai_audio_stream_shutdown, NULL);
 
 /* freeing a subclass that was not reserved by this module is a harmless no-op */
 static void free_event_subclasses(void) {
@@ -56,7 +54,6 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
                 return SWITCH_FALSE;
             }
             return stream_frame(bug);
-            break;
         case SWITCH_ABC_TYPE_WRITE_REPLACE: // This is where the mediabug will write audio data to the channel
             if (switch_atomic_read(&tech_pvt->close_requested)) {
                 return SWITCH_FALSE;
@@ -158,27 +155,19 @@ static switch_status_t start_capture(switch_core_session_t *session, switch_medi
 }
 
 static switch_status_t do_stop(switch_core_session_t *session, char *json) {
-    switch_status_t status = SWITCH_STATUS_SUCCESS;
-
     if (json) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                           "mod_openai_audio_stream: stop w/ final json %s\n", json);
     } else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_openai_audio_stream: stop\n");
     }
-    status = stream_session_cleanup(session, json, 0);
-
-    return status;
+    return stream_session_cleanup(session, json, 0);
 }
 
 static switch_status_t do_pauseresume(switch_core_session_t *session, int pause) {
-    switch_status_t status = SWITCH_STATUS_SUCCESS;
-
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_openai_audio_stream: %s\n",
                       pause ? "pause" : "resume");
-    status = stream_session_pauseresume(session, pause);
-
-    return status;
+    return stream_session_pauseresume(session, pause);
 }
 
 static switch_status_t do_audio_mute(switch_core_session_t *session, const char *target, int mute) {

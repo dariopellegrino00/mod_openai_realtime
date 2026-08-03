@@ -36,6 +36,8 @@
 
 namespace {
 
+constexpr std::size_t PLAYBACK_BUFFER_BYTES = 128000;
+
 struct StreamConfig {
     // String pointers are borrowed only for the synchronous stream_data_init construction path;
     // AudioStreamer copies every value it needs and never retains the pointers.
@@ -602,6 +604,7 @@ class AudioStreamer {
 
     ~AudioStreamer() {
         disconnect();
+        deleteFiles();
         if (m_resampler) {
             speex_resampler_destroy(m_resampler);
             m_resampler = nullptr;
@@ -719,36 +722,20 @@ class AudioStreamer {
         return m_terminal_close;
     }
 
-    void openai_speech_started() {
+    void openai_speech_started(switch_core_session_t *session) {
         m_openai_speaking = true;
-        switch_core_session_t *psession = switch_core_session_locate(m_sessionId.c_str());
-
-        if (psession) {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "(%s) Openai started speaking\n",
-                              m_sessionId.c_str());
-            const char *payload = "{\"status\":\"started\"}";
-            m_notify(psession, EVENT_OPENAI_SPEECH_STARTED, payload);
-            switch_core_session_rwunlock(psession);
-        } else {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                              "(%s) Openai speech started - could not locate session\n", m_sessionId.c_str());
-        }
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) OpenAI started speaking\n",
+                          m_sessionId.c_str());
+        const char *payload = "{\"status\":\"started\"}";
+        m_notify(session, EVENT_OPENAI_SPEECH_STARTED, payload);
     }
 
-    void openai_speech_stopped() {
+    void openai_speech_stopped(switch_core_session_t *session) {
         m_openai_speaking = false;
-        switch_core_session_t *psession = switch_core_session_locate(m_sessionId.c_str());
-
-        if (psession) {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "(%s) Openai stopped speaking\n",
-                              m_sessionId.c_str());
-            const char *payload = "{\"status\":\"stopped\"}";
-            m_notify(psession, EVENT_OPENAI_SPEECH_STOPPED, payload);
-            switch_core_session_rwunlock(psession);
-        } else {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                              "(%s) Openai speech stopped - could not locate session\n", m_sessionId.c_str());
-        }
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) OpenAI stopped speaking\n",
+                          m_sessionId.c_str());
+        const char *payload = "{\"status\":\"stopped\"}";
+        m_notify(session, EVENT_OPENAI_SPEECH_STOPPED, payload);
     }
 
   private:
@@ -777,6 +764,39 @@ class AudioStreamer {
     uint8_t m_pending_raw_byte = 0;      // raw mode: trailing odd byte carried to the next binary frame
     bool m_has_pending_raw_byte = false; // WebSocket thread only
 };
+
+class StreamRuntime {
+  public:
+    StreamRuntime(const char *session_id, const StreamConfig& config, private_t *owner)
+        : m_streamer(new AudioStreamer(session_id, config, owner)) {}
+
+    AudioStreamer *streamer() {
+        return m_streamer.get();
+    }
+
+    StreamBuffers& buffers() {
+        return m_buffers;
+    }
+
+    void finish() {
+        m_streamer.reset();
+    }
+
+  private:
+    // Members are destroyed in reverse order: the WebSocket-owning streamer stops before
+    // the callback/media scratch buffers disappear.
+    StreamBuffers m_buffers;
+    std::unique_ptr<AudioStreamer> m_streamer;
+};
+
+StreamRuntime *stream_runtime(private_t *data) {
+    return data ? static_cast<StreamRuntime *>(data->cpp_context) : nullptr;
+}
+
+AudioStreamer *audio_streamer(private_t *data) {
+    StreamRuntime *runtime = stream_runtime(data);
+    return runtime ? runtime->streamer() : nullptr;
+}
 
 using LifecycleMutex = std::recursive_mutex;
 
@@ -848,7 +868,7 @@ class LifecycleLockScope {
 };
 
 switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *session, const StreamConfig& config) {
-    int err; // speex
+    int err = RESAMPLER_ERR_SUCCESS;
 
     switch_memory_pool_t *pool = switch_core_session_get_pool(session);
 
@@ -866,9 +886,7 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
 
     const size_t buflen = static_cast<size_t>(FRAME_SIZE_8000) * config.capture_output_rate / 8000 * config.channels *
                           config.capture_packet_count;
-    const size_t playback_buflen = 128000; // 128KB may need to be decreased
-
-    if (switch_buffer_create(pool, &tech_pvt->playback_buffer, playback_buflen) != SWITCH_STATUS_SUCCESS) {
+    if (switch_buffer_create(pool, &tech_pvt->playback_buffer, PLAYBACK_BUFFER_BYTES) != SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "%s: Error creating playback buffer.\n", tech_pvt->sessionId);
         return SWITCH_STATUS_FALSE;
@@ -878,8 +896,7 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
     // boundary. tech_pvt was memset to zero, so the caller's destroy_tech_pvt() safely tears down
     // whatever was already built.
     try {
-        tech_pvt->pAudioStreamer = static_cast<void *>(new AudioStreamer(tech_pvt->sessionId, config, tech_pvt));
-        tech_pvt->stream_buffers = static_cast<void *>(new StreamBuffers());
+        tech_pvt->cpp_context = static_cast<void *>(new StreamRuntime(tech_pvt->sessionId, config, tech_pvt));
     } catch (const std::exception& e) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "%s: failed to initialize stream context: %s\n", tech_pvt->sessionId, e.what());
@@ -921,12 +938,9 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
 
 void destroy_tech_pvt(private_t *tech_pvt) {
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "%s destroy_tech_pvt\n", tech_pvt->sessionId);
-    if (tech_pvt->pAudioStreamer) {
-        auto *as = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
-        // Stop and join the WebSocket thread before destroying state its callbacks may use
-        as->disconnect();
-        delete as;
-        tech_pvt->pAudioStreamer = nullptr;
+    if (tech_pvt->cpp_context) {
+        delete stream_runtime(tech_pvt);
+        tech_pvt->cpp_context = nullptr;
     }
     if (tech_pvt->resampler) {
         speex_resampler_destroy(tech_pvt->resampler);
@@ -936,21 +950,12 @@ void destroy_tech_pvt(private_t *tech_pvt) {
         switch_mutex_destroy(tech_pvt->mutex);
         tech_pvt->mutex = nullptr;
     }
-    if (tech_pvt->stream_buffers) {
-        auto *sb = static_cast<StreamBuffers *>(tech_pvt->stream_buffers);
-        delete sb;
-        tech_pvt->stream_buffers = nullptr;
-    }
 }
 
 void finish(private_t *tech_pvt) {
-    auto *aStreamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
-    tech_pvt->pAudioStreamer = nullptr;
-    if (aStreamer) {
-        // Stop and join before deleting callback-owned state or debug files.
-        aStreamer->disconnect();
-        aStreamer->deleteFiles();
-        delete aStreamer;
+    StreamRuntime *runtime = stream_runtime(tech_pvt);
+    if (runtime) {
+        runtime->finish();
     }
 }
 
@@ -964,12 +969,13 @@ void flush_capture_residue(private_t *tech_pvt) {
     if (inuse == 0) {
         return;
     }
-    auto *streamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
-    auto *bufs = static_cast<StreamBuffers *>(tech_pvt->stream_buffers);
-    if (streamer && streamer->isConnected() && bufs) {
-        bufs->flush_buffer.resize(inuse);
-        switch_buffer_read(tech_pvt->sbuffer, bufs->flush_buffer.data(), inuse);
-        streamer->sendAudio(bufs->flush_buffer.data(), inuse);
+    StreamRuntime *runtime = stream_runtime(tech_pvt);
+    AudioStreamer *streamer = runtime ? runtime->streamer() : nullptr;
+    if (streamer && streamer->isConnected()) {
+        StreamBuffers& buffers = runtime->buffers();
+        buffers.flush_buffer.resize(inuse);
+        switch_buffer_read(tech_pvt->sbuffer, buffers.flush_buffer.data(), inuse);
+        streamer->sendAudio(buffers.flush_buffer.data(), inuse);
     }
     switch_buffer_zero(tech_pvt->sbuffer);
 }
@@ -1036,7 +1042,7 @@ switch_status_t stream_session_send_json(switch_core_session_t *session, const c
     cJSON *json_obj = nullptr;
     char *json_unformatted = nullptr;
     switch_status_t status = SWITCH_STATUS_FALSE;
-    AudioStreamer *streamer = static_cast<AudioStreamer *>(context.data->pAudioStreamer);
+    AudioStreamer *streamer = audio_streamer(context.data);
     if (!streamer) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "stream_session_send_json failed: AudioStreamer websocket is null.\n");
@@ -1133,13 +1139,12 @@ switch_status_t stream_session_set_user_mute(switch_core_session_t *session, int
         // Deliver the residual pre-mute speech before injecting silence, instead of dropping it
         flush_capture_residue(tech_pvt);
 
-        AudioStreamer *streamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
+        AudioStreamer *streamer = audio_streamer(tech_pvt);
         if (streamer && streamer->isConnected()) {
-            size_t channels = tech_pvt->channels > 0 ? static_cast<size_t>(tech_pvt->channels) : 1;
-            size_t sample_rate = tech_pvt->sampling > 0
-                                     ? static_cast<size_t>(tech_pvt->sampling)
-                                     : 24000; // 24 KHz is currently the only supported rate by openai
-            size_t bytes = channels * sample_rate * sizeof(int16_t);
+            const size_t channels = tech_pvt->channels > 0 ? static_cast<size_t>(tech_pvt->channels) : 1;
+            // Official OpenAI Realtime uses 24 kHz; compatible backends may configure another rate.
+            const size_t sample_rate = tech_pvt->sampling > 0 ? static_cast<size_t>(tech_pvt->sampling) : size_t{24000};
+            const size_t bytes = channels * sample_rate * sizeof(int16_t);
             std::vector<uint8_t> silence(bytes, 0);
             if (streamer->sendAudio(silence.data(), silence.size())) {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
@@ -1314,11 +1319,10 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
         }
     } else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-                          "OPENAI_API_KEY is not set. Assuming you set STREAM_EXTRA_HEADERS variable.\n");
+                          "STREAM_OPENAI_API_KEY is not set. Assuming you set STREAM_EXTRA_HEADERS variable.\n");
         extra_headers = switch_channel_get_variable(channel, "STREAM_EXTRA_HEADERS");
     }
 
-    // allocate per-session tech_pvt
     auto *tech_pvt = static_cast<private_t *>(switch_core_session_alloc(session, sizeof(private_t)));
 
     if (!tech_pvt) {
@@ -1381,7 +1385,7 @@ switch_status_t stream_session_start(void *pUserData) {
         return SWITCH_STATUS_FALSE;
     }
     auto *tech_pvt = static_cast<private_t *>(pUserData);
-    auto *streamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
+    AudioStreamer *streamer = audio_streamer(tech_pvt);
     return streamer && streamer->start() ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
 }
 
@@ -1394,26 +1398,27 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
         return SWITCH_TRUE;
     }
 
-    auto *pAudioStreamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
+    StreamRuntime *runtime = stream_runtime(tech_pvt);
+    AudioStreamer *streamer = runtime ? runtime->streamer() : nullptr;
 
-    if (!pAudioStreamer || !pAudioStreamer->isConnected()) {
+    if (!streamer || !streamer->isConnected()) {
         switch_mutex_unlock(tech_pvt->mutex);
         return SWITCH_TRUE;
     }
 
     // Discard any capture residue left over from a dropped connection
-    if (pAudioStreamer->consume_capture_reset() && tech_pvt->sbuffer) {
+    if (streamer->consume_capture_reset() && tech_pvt->sbuffer) {
         switch_buffer_zero(tech_pvt->sbuffer);
     }
 
-    // Get persistent buffers (allocated once per session, reused across all frames)
-    auto *bufs = static_cast<StreamBuffers *>(tech_pvt->stream_buffers);
+    // Persistent buffers are direct runtime members and live for the whole session.
+    StreamBuffers& buffers = runtime->buffers();
 
     auto flush_sbuffer = [tech_pvt]() { flush_capture_residue(tech_pvt); };
 
-    auto send_or_buffer_audio = [tech_pvt, pAudioStreamer, &flush_sbuffer](const uint8_t *data, size_t length) {
+    auto send_or_buffer_audio = [tech_pvt, streamer, &flush_sbuffer](const uint8_t *data, size_t length) {
         if (tech_pvt->rtp_packets == 1) {
-            pAudioStreamer->sendAudio(data, length);
+            streamer->sendAudio(data, length);
             return true;
         }
 
@@ -1447,7 +1452,7 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
     };
 
     switch_frame_t frame{};
-    frame.data = bufs->data_buf.data();
+    frame.data = buffers.data_buf.data();
     frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
 
     while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
@@ -1475,7 +1480,7 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
         const uint64_t estimated_output =
             (static_cast<uint64_t>(frame.samples) * output_rate + input_rate - 1) / input_rate;
         const spx_uint32_t output_capacity = static_cast<spx_uint32_t>(estimated_output + 1);
-        bufs->resample_buffer.resize(static_cast<size_t>(output_capacity) * tech_pvt->channels);
+        buffers.resample_buffer.resize(static_cast<size_t>(output_capacity) * tech_pvt->channels);
 
         const auto *input = static_cast<const spx_int16_t *>(frame.data);
         spx_uint32_t remaining_samples = frame.samples;
@@ -1486,10 +1491,10 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
 
             if (tech_pvt->channels == 1) {
                 result = speex_resampler_process_int(tech_pvt->resampler, 0, input, &in_len,
-                                                     bufs->resample_buffer.data(), &out_len);
+                                                     buffers.resample_buffer.data(), &out_len);
             } else {
                 result = speex_resampler_process_interleaved_int(tech_pvt->resampler, input, &in_len,
-                                                                 bufs->resample_buffer.data(), &out_len);
+                                                                 buffers.resample_buffer.data(), &out_len);
             }
 
             if (result != RESAMPLER_ERR_SUCCESS) {
@@ -1500,7 +1505,8 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
 
             size_t bytes_written = static_cast<size_t>(out_len) * tech_pvt->channels * sizeof(spx_int16_t);
             if (bytes_written > 0 &&
-                !send_or_buffer_audio(reinterpret_cast<const uint8_t *>(bufs->resample_buffer.data()), bytes_written)) {
+                !send_or_buffer_audio(reinterpret_cast<const uint8_t *>(buffers.resample_buffer.data()),
+                                      bytes_written)) {
                 break;
             }
 
@@ -1532,7 +1538,7 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
         return SWITCH_TRUE;
     }
 
-    AudioStreamer *as = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
+    AudioStreamer *as = audio_streamer(tech_pvt);
 
     // No isConnected() check: queued audio must keep draining after the connection drops
     if (!as) {
@@ -1558,7 +1564,7 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
         inuse = 0;
         // barge-in interrupts the response: close the speaking state so the next one emits a new start
         if (as->is_openai_speaking()) {
-            as->openai_speech_stopped();
+            as->openai_speech_stopped(session);
         }
     }
     bool chunk_enqueued = false;
@@ -1580,7 +1586,7 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
     if (!chunk_enqueued && inuse == 0) {
         // Openai just finished speaking for interruption or end of response
         if (as->is_openai_speaking() && as->is_response_audio_done()) {
-            as->openai_speech_stopped();
+            as->openai_speech_stopped(session);
         }
         if (terminal_close) {
             // Nothing left to play and no new audio can arrive: tear down the stream
@@ -1606,7 +1612,7 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
         }
 
         if (!as->is_openai_speaking()) {
-            as->openai_speech_started();
+            as->openai_speech_started(session);
         }
 
         frame->datalen = bytes_needed;

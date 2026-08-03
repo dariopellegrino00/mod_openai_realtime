@@ -25,7 +25,7 @@ struct private_data {
     switch_mutex_t *mutex;
     char sessionId[MAX_SESSION_ID];
     SpeexResamplerState *resampler;
-    void *pAudioStreamer;
+    void *cpp_context;
     int sampling;
     int channels;
     switch_atomic_t audio_paused;
@@ -35,7 +35,6 @@ struct private_data {
     switch_buffer_t *sbuffer;
     int rtp_packets;
     switch_buffer_t *playback_buffer;
-    void *stream_buffers;
 };
 
 typedef struct private_data private_t;
