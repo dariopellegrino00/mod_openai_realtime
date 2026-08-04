@@ -13,6 +13,27 @@ project(mod_openai_audio_stream
 include(GNUInstallDirs)
 
 option(ENABLE_LOCAL "Enable local compile/debug specific" OFF)
+option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+
+if(ENABLE_SANITIZERS)
+    if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang|GNU" OR
+       NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        message(FATAL_ERROR "ENABLE_SANITIZERS requires Clang or GCC")
+    endif()
+
+    message(STATUS "AddressSanitizer and UndefinedBehaviorSanitizer enabled")
+    add_compile_options(
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer
+        -fno-sanitize-recover=all
+    )
+    add_link_options(
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer
+        -fno-sanitize-recover=all
+    )
+endif()
+
 if(ENABLE_LOCAL)
     set(ENV{PKG_CONFIG_PATH} "/usr/local/freeswitch/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
 endif()

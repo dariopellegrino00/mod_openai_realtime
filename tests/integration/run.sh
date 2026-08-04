@@ -6,6 +6,23 @@ mock_ready=/tmp/mod-openai-mock-ready
 freeswitch_log=/tmp/mod-openai-freeswitch.log
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 
+start_freeswitch() {
+    if [ "${ENABLE_INTEGRATION_SANITIZERS:-0}" = "1" ]; then
+        asan_runtime=$(gcc -print-file-name=libasan.so)
+        if [ ! -f "${asan_runtime}" ]; then
+            echo "AddressSanitizer runtime not found: ${asan_runtime}" >&2
+            return 1
+        fi
+
+        LD_PRELOAD="${asan_runtime}" \
+            ASAN_OPTIONS="detect_leaks=0:halt_on_error=1" \
+            UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+            freeswitch -nonat -ncwait
+    else
+        freeswitch -nonat -ncwait
+    fi
+}
+
 cleanup() {
     fs_cli -x shutdown >/dev/null 2>&1 || true
     if [ -n "${mock_pid:-}" ]; then
@@ -36,7 +53,7 @@ while [ ! -e "${mock_ready}" ]; do
     sleep 0.05
 done
 
-if ! freeswitch -nonat -ncwait >"${freeswitch_log}" 2>&1; then
+if ! start_freeswitch >"${freeswitch_log}" 2>&1; then
     echo "FreeSWITCH failed to start" >&2
     cat "${freeswitch_log}" >&2
     exit 1

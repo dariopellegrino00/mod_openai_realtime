@@ -19,8 +19,11 @@ Run all unit tests:
 Run them with AddressSanitizer and UndefinedBehaviorSanitizer when the compiler runtimes are installed:
 
 ```sh
-BUILD_DIR=build/tests-sanitized ./tests/run-unit.sh --sanitizers
+./tests/run-unit.sh --sanitizers
 ```
+
+Normal and sanitized runs use separate build directories, so switching between them cannot retain stale CMake
+options. GCC installations may provide the sanitizer runtimes in separate system packages.
 
 The unit executables are registered with CTest. The manual commands below default to two parallel jobs for
 portability; set `CMAKE_BUILD_PARALLEL_LEVEL` to override the default:
@@ -28,7 +31,8 @@ portability; set `CMAKE_BUILD_PARALLEL_LEVEL` to override the default:
 ```sh
 cmake -S tests -B build/tests
 cmake --build build/tests --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
-ctest --test-dir build/tests --output-on-failure
+cd build/tests
+ctest --output-on-failure --no-tests=error
 ```
 
 These tests compile the same `stream_protocol.cpp` and `base64.cpp` files linked into the FreeSWITCH module. No copied
@@ -70,8 +74,9 @@ INTEGRATION_BASE_IMAGE=mod-openai-realtime-integration:local ./tests/run-integra
 `TEST_IMAGE` controls the local runner image name. The previous `INTEGRATION_IMAGE` override remains supported as an
 alias for `TEST_IMAGE`.
 
-`tests/run-ci.sh` is the entry point shared by local Docker runs and GitHub Actions. It runs the sanitized unit suite,
-builds and installs the module, and then starts the real FreeSWITCH integration suite.
+`tests/run-ci.sh` is an internal container entry point shared by local Docker runs and GitHub Actions; do not invoke
+it directly on the host. It runs the sanitized unit suite, builds and installs a sanitized module, and then starts
+the real FreeSWITCH integration suite. Sanitizers remain disabled for normal module builds and releases.
 
 ## CI image lifecycle
 
