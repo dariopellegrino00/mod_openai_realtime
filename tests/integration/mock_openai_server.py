@@ -20,6 +20,18 @@ def pcm16_tone(sample_rate, frequency, duration_seconds, amplitude=12000, start_
     return struct.pack(f"<{sample_count}h", *samples)
 
 
+def request_metadata(websocket, legacy_path=None):
+    """Return the request path and headers across websockets 10.x and 14+."""
+    request = getattr(websocket, "request", None)
+    path = legacy_path or getattr(websocket, "path", None) or getattr(request, "path", "/")
+    headers = getattr(websocket, "request_headers", None)
+    if headers is None:
+        headers = getattr(request, "headers", None)
+    if headers is None:
+        raise RuntimeError("unsupported websockets request API: request headers are unavailable")
+    return path, headers
+
+
 class MockRealtimeServer:
     def __init__(self, event_log: Path, ready_file: Path):
         self.event_log = event_log
@@ -33,8 +45,13 @@ class MockRealtimeServer:
                 log.write(json.dumps(payload, sort_keys=True) + "\n")
 
     async def handle(self, websocket, path=None):
-        path = path or getattr(websocket, "path", "/")
-        await self.record("connected", path=path)
+        path, headers = request_metadata(websocket, path)
+        await self.record(
+            "connected",
+            path=path,
+            authorization_headers=headers.get_all("Authorization"),
+            integration_headers=headers.get_all("X-Integration-Test"),
+        )
 
         try:
             if path == "/close-immediately":

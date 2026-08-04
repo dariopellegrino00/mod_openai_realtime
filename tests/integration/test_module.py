@@ -15,6 +15,7 @@ MOCK_URL = "ws://127.0.0.1:18080"
 EVENT_LOG = Path("/tmp/mod-openai-mock-events.jsonl")
 PLAYBACK_DRAIN_MARGIN_SECONDS = 0.4
 PLAYBACK_DURATION_TOLERANCE_SECONDS = 0.1
+PCM16_BYTES_PER_SAMPLE = 2
 
 
 def api(command, timeout=10):
@@ -84,7 +85,7 @@ def read_mono_pcm16(path):
         sample_rate = recording.getframerate()
         frames = recording.readframes(recording.getnframes())
 
-    if sample_width != 2:
+    if sample_width != PCM16_BYTES_PER_SAMPLE:
         raise AssertionError(f"expected PCM16 recording, got {sample_width * 8}-bit samples")
 
     samples = array("h")
@@ -202,6 +203,7 @@ class ModuleIntegrationTest(unittest.TestCase):
         assert_ok(self, command)
         connected = wait_for_event(lambda event: event.get("event") == "connected", before)
         self.assertIsNotNone(connected, "module did not connect to the mock WebSocket server")
+        return connected
 
     def start_recording(self, scenario):
         self.recording = Path(f"/tmp/mod-openai-{scenario}-{self.uuid}.wav")
@@ -274,6 +276,60 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(audio, "module did not send caller audio to the WebSocket")
         self.assertGreater(audio["size"], 0, "module sent an empty audio payload")
         self.assertTrue(audio["sample_aligned"], "module sent a partial PCM16 sample")
+        self.stop_stream()
+
+    def test_capture_buffering_and_user_mute(self):
+        capture_rate = 24000
+        buffer_ms = 100
+        aggregated_size = capture_rate * buffer_ms // 1000 * PCM16_BYTES_PER_SAMPLE
+        mute_silence_size = capture_rate * PCM16_BYTES_PER_SAMPLE
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_BUFFER_SIZE {buffer_ms}")
+
+        before = len(mock_events())
+        self.start_stream(start_muted=False)
+        aggregated = wait_for_event(
+            lambda event: event.get("event") == "audio-received" and event.get("size") == aggregated_size,
+            before,
+        )
+        self.assertIsNotNone(aggregated, "capture audio was not aggregated to the configured duration")
+
+        before = len(mock_events())
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} mute user")
+        mute_silence = wait_for_event(
+            lambda event: event.get("event") == "audio-received" and event.get("size") == mute_silence_size,
+            before,
+        )
+        self.assertIsNotNone(mute_silence, "muting did not send one second of silence")
+
+        muted_since = len(mock_events())
+        time.sleep(0.25)
+        audio_while_muted = [
+            event for event in mock_events()[muted_since:] if event.get("event") == "audio-received"
+        ]
+        self.assertEqual(audio_while_muted, [], "caller audio continued while user mute was active")
+
+        before = len(mock_events())
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} unmute user")
+        resumed = wait_for_event(
+            lambda event: event.get("event") == "audio-received" and event.get("size") == aggregated_size,
+            before,
+        )
+        self.assertIsNotNone(resumed, "capture audio did not resume after unmute")
+        self.stop_stream()
+
+    def test_extra_headers_merge_with_authorization(self):
+        extra_headers = json.dumps(
+            {
+                "Authorization": "Bearer must-be-replaced",
+                "X-Integration-Test": "preserved",
+            },
+            separators=(",", ":"),
+        )
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_EXTRA_HEADERS {extra_headers}")
+
+        connected = self.start_stream()
+        self.assertEqual(connected["authorization_headers"], ["Bearer integration-test-key"])
+        self.assertEqual(connected["integration_headers"], ["preserved"])
         self.stop_stream()
 
     def test_playback_audio_reaches_channel(self):

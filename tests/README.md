@@ -46,6 +46,7 @@ barge-in buffer clearing, and the private lifecycle of temporary debug WAV files
 reuses `response_id` for a later response and verifies that the peer-provided ID does not suppress valid playback
 audio.
 Raw mode is covered in both directions, including binary PCM playback split across odd WebSocket frame boundaries.
+Capture tests verify configured packet aggregation, user mute/unmute semantics, and WebSocket header precedence.
 
 ```sh
 ./tests/run-integration.sh
