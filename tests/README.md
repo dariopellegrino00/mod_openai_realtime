@@ -45,6 +45,7 @@ audible duration, and dominant frequency. The playback tests exercise normal del
 barge-in buffer clearing, and the private lifecycle of temporary debug WAV files. A compatibility scenario also
 reuses `response_id` for a later response and verifies that the peer-provided ID does not suppress valid playback
 audio.
+Raw mode is covered in both directions, including binary PCM playback split across odd WebSocket frame boundaries.
 
 ```sh
 ./tests/run-integration.sh

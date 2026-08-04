@@ -186,9 +186,17 @@ class ModuleIntegrationTest(unittest.TestCase):
         assert_ok(self, f"uuid_broadcast {uuid} silence_stream://-1 aleg")
         return uuid
 
-    def start_stream(self, url=MOCK_URL, start_muted=True):
+    def start_stream(
+        self,
+        url=MOCK_URL,
+        start_muted=True,
+        stream_api="uuid_openai_audio_stream",
+        playback_rate=None,
+    ):
         before = len(mock_events())
-        command = f"uuid_openai_audio_stream {self.uuid} start {url} mono 24k"
+        command = f"{stream_api} {self.uuid} start {url} mono 24k"
+        if playback_rate is not None:
+            command += f" {playback_rate}"
         if start_muted:
             command += " mute_user"
         assert_ok(self, command)
@@ -205,9 +213,9 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertTrue(self.recording.exists(), "FreeSWITCH did not create the playback recording")
         return read_mono_pcm16(self.recording)
 
-    def stop_stream(self, final_payload=None):
+    def stop_stream(self, final_payload=None, stream_api="uuid_openai_audio_stream"):
         before = len(mock_events())
-        command = f"uuid_openai_audio_stream {self.uuid} stop"
+        command = f"{stream_api} {self.uuid} stop"
         if final_payload is not None:
             command += f" {encode_json(final_payload)}"
         assert_ok(self, command)
@@ -391,6 +399,49 @@ class ModuleIntegrationTest(unittest.TestCase):
 
         self.stop_stream()
         self.assertTrue(wait_until(lambda: not debug_file.exists()), "debug WAV survived stream teardown")
+
+    def test_raw_audio_streams_binary_pcm_in_both_directions(self):
+        stream_api = "uuid_raw_audio_stream"
+        before = len(mock_events())
+        # setUp keeps debug WAVs disabled because the mock deliberately sends one frame per byte.
+        # Requesting the mock's 8 kHz rate isolates PCM16 stitching; JSON playback covers resampling.
+        self.start_stream(
+            f"{MOCK_URL}/raw-audio",
+            start_muted=False,
+            stream_api=stream_api,
+            playback_rate="8k",
+        )
+        caller_audio = wait_for_event(lambda event: event.get("event") == "binary", before)
+        self.assertIsNotNone(caller_audio, "raw mode did not send caller audio as a binary WebSocket frame")
+        self.assertGreater(caller_audio["size"], 0)
+        self.assertTrue(caller_audio["sample_aligned"], "raw caller audio ended with a partial PCM16 sample")
+
+        self.start_recording("raw-audio")
+        before = len(mock_events())
+        request = encode_json({"type": "response.create"})
+        assert_ok(self, f"{stream_api} {self.uuid} send_json {request}")
+        sent = wait_for_event(lambda event: event.get("event") == "raw-audio-response-sent", before)
+        self.assertIsNotNone(sent, "mock binary playback stream was not delivered")
+        self.assertGreater(sent["split_frame_count"], 1, "mock did not split the binary PCM stream")
+        time.sleep(1)
+
+        sample_rate, samples = self.stop_recording()
+        durations = tone_durations(
+            samples,
+            sample_rate,
+            (sent["split_frequency"], sent["regular_frequency"]),
+        )
+        self.assertGreater(
+            durations[sent["split_frequency"]],
+            sent["split_duration"] / 2,
+            "split PCM16 samples were not reconstructed",
+        )
+        self.assertGreater(
+            durations[sent["regular_frequency"]],
+            sent["regular_duration"] * 0.8,
+            "regular binary playback was truncated",
+        )
+        self.stop_stream(stream_api=stream_api)
 
     def test_double_start_is_rejected(self):
         self.start_stream()

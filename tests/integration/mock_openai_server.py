@@ -48,7 +48,7 @@ class MockRealtimeServer:
 
             async for message in websocket:
                 if isinstance(message, bytes):
-                    await self.record("binary", size=len(message))
+                    await self.record("binary", size=len(message), sample_aligned=len(message) % 2 == 0)
                     continue
 
                 try:
@@ -81,6 +81,8 @@ class MockRealtimeServer:
                         await self.send_barge_in_response(websocket)
                     elif path == "/debug-audio":
                         await self.send_debug_audio_response(websocket)
+                    elif path == "/raw-audio":
+                        await self.send_raw_audio_response(websocket)
                     else:
                         await self.send_audio_response(websocket)
                 elif message_type == "integration.reused_response_id":
@@ -223,6 +225,31 @@ class MockRealtimeServer:
         await self.send_audio_delta(websocket, response_id, audio)
         await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
         await self.record("debug-audio-response-sent", sample_rate=sample_rate, byte_count=len(audio))
+
+    async def send_raw_audio_response(self, websocket):
+        sample_rate = 8000
+        split_frequency = 700
+        regular_frequency = 1400
+        split_duration = 0.12
+        regular_duration = 0.5
+        split_audio = pcm16_tone(sample_rate, split_frequency, split_duration)
+        regular_audio = pcm16_tone(sample_rate, regular_frequency, regular_duration)
+
+        # Splitting every PCM16 sample across two one-byte WebSocket frames makes the
+        # carry-byte contract observable: dropping odd trailing bytes removes this tone.
+        for byte in split_audio:
+            await websocket.send(bytes((byte,)))
+        await websocket.send(regular_audio)
+
+        await websocket.send(json.dumps({"type": "response.output_audio.done"}))
+        await self.record(
+            "raw-audio-response-sent",
+            split_frequency=split_frequency,
+            regular_frequency=regular_frequency,
+            split_duration=split_duration,
+            regular_duration=regular_duration,
+            split_frame_count=len(split_audio),
+        )
 
     async def run(self, host, port):
         self.event_log.unlink(missing_ok=True)
