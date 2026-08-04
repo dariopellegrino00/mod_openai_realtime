@@ -37,6 +37,7 @@ class MockRealtimeServer:
         self.event_log = event_log
         self.ready_file = ready_file
         self._lock = asyncio.Lock()
+        self._connection_counts = {}
 
     async def record(self, event, **fields):
         payload = {"event": event, **fields}
@@ -46,17 +47,20 @@ class MockRealtimeServer:
 
     async def handle(self, websocket, path=None):
         path, headers = request_metadata(websocket, path)
+        connection_number = self._connection_counts.get(path, 0) + 1
+        self._connection_counts[path] = connection_number
         await self.record(
             "connected",
             path=path,
+            connection_number=connection_number,
             authorization_headers=headers.get_all("Authorization"),
             integration_headers=headers.get_all("X-Integration-Test"),
         )
 
         try:
-            if path == "/close-immediately":
+            if path == "/close-immediately" or (path == "/reconnect" and connection_number == 1):
                 await websocket.close(code=1011, reason="intentional integration-test close")
-                await self.record("closed", path=path)
+                await self.record("closed", path=path, connection_number=connection_number)
                 return
 
             # Exercise the startup ordering: the peer is allowed to send a message as soon as
@@ -81,11 +85,21 @@ class MockRealtimeServer:
                     except (ValueError, TypeError):
                         await self.record("invalid-audio-message")
                     else:
-                        await self.record(
-                            "audio-received",
-                            size=len(audio),
-                            sample_aligned=len(audio) % 2 == 0,
-                        )
+                        samples = struct.unpack(f"<{len(audio) // 2}h", audio) if len(audio) % 2 == 0 else ()
+                        audio_event = {
+                            "path": path,
+                            "connection_number": connection_number,
+                            "size": len(audio),
+                            "sample_aligned": len(audio) % 2 == 0,
+                            "all_zero": not any(audio),
+                            "peak_amplitude": max((abs(sample) for sample in samples), default=0),
+                        }
+                        if path == "/stereo-capture":
+                            audio_event["channel_peak_amplitudes"] = [
+                                max((abs(sample) for sample in samples[channel::2]), default=0)
+                                for channel in range(2)
+                            ]
+                        await self.record("audio-received", **audio_event)
                 else:
                     await self.record("message", type=message_type, payload=payload)
 

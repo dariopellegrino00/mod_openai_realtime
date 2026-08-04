@@ -2,6 +2,7 @@
 import base64
 import json
 import math
+import os
 import subprocess
 import sys
 import time
@@ -15,7 +16,11 @@ MOCK_URL = "ws://127.0.0.1:18080"
 EVENT_LOG = Path("/tmp/mod-openai-mock-events.jsonl")
 PLAYBACK_DRAIN_MARGIN_SECONDS = 0.4
 PLAYBACK_DURATION_TOLERANCE_SECONDS = 0.1
+FREESWITCH_LOG = Path(os.environ.get("FREESWITCH_RUNTIME_LOG", "/tmp/mod-openai-freeswitch.log"))
+ARTIFACT_DIR = Path(os.environ["TEST_ARTIFACT_DIR"]) if os.environ.get("TEST_ARTIFACT_DIR") else None
 PCM16_BYTES_PER_SAMPLE = 2
+AUDIBLE_SAMPLE_THRESHOLD = 500
+MODULE_LOG_SOURCES = ("mod_openai_audio_stream.c:", "openai_audio_streamer_glue.cpp:")
 
 
 def api(command, timeout=10):
@@ -125,7 +130,7 @@ def audible_duration(samples, sample_rate):
     for offset in range(0, len(samples) - window_size + 1, window_size):
         window = samples[offset : offset + window_size]
         mean_square = sum(sample * sample for sample in window) / len(window)
-        if mean_square >= 500**2:
+        if mean_square >= AUDIBLE_SAMPLE_THRESHOLD**2:
             active_samples += len(window)
     return active_samples / sample_rate
 
@@ -152,7 +157,7 @@ def active_runs(samples, sample_rate, window_ms=5, threshold=500):
     return runs, active_windows * window_size / sample_rate
 
 
-def tone_durations(samples, sample_rate, frequencies, window_ms=20, threshold=500):
+def tone_durations(samples, sample_rate, frequencies, window_ms=20, threshold=AUDIBLE_SAMPLE_THRESHOLD):
     window_size = max(sample_rate * window_ms // 1000, 1)
     windows = {frequency: 0 for frequency in frequencies}
     for offset in range(0, len(samples) - window_size + 1, window_size):
@@ -167,25 +172,68 @@ def tone_durations(samples, sample_rate, frequencies, window_ms=20, threshold=50
 
 class ModuleIntegrationTest(unittest.TestCase):
     def setUp(self):
-        self.uuid = self.originate_call()
+        self.uuid = None
+        self.recording = None
+        self.event_start = len(mock_events())
+        self.freeswitch_log_start = FREESWITCH_LOG.stat().st_size
+        self.check_module_errors = False
+        self.addCleanup(self.cleanup_resources)
+        self.originate_call()
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_OPENAI_API_KEY integration-test-key")
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_DISABLE_AUDIOFILES true")
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT true")
 
     def tearDown(self):
-        if getattr(self, "uuid", None):
-            api(f"uuid_kill {self.uuid}")
-        recording = getattr(self, "recording", None)
-        if recording:
-            recording.unlink(missing_ok=True)
+        self.cleanup_resources()
         self.assertTrue(api("status").startswith("UP"), "FreeSWITCH stopped during the test")
+        events = mock_events()[self.event_start :]
+        invalid_events = [
+            event for event in events if event.get("event") in {"invalid-json", "invalid-audio-message"}
+        ]
+        self.assertEqual(invalid_events, [], "module sent malformed data to the mock WebSocket server")
+        misaligned_audio = [
+            event
+            for event in events
+            if event.get("event") in {"audio-received", "binary"} and event.get("sample_aligned") is not True
+        ]
+        self.assertEqual(misaligned_audio, [], "module sent a partial PCM16 sample")
+        if self.check_module_errors:
+            self.assert_no_module_errors()
+
+    def cleanup_resources(self):
+        try:
+            if self.uuid:
+                uuid = self.uuid
+                self.uuid = None
+                api(f"uuid_kill {uuid}")
+        finally:
+            if self.recording and ARTIFACT_DIR is None:
+                self.recording.unlink(missing_ok=True)
 
     def originate_call(self):
         result = api("originate null/+15555550100 &park()")
         self.assertTrue(result.startswith("+OK "), f"could not originate test channel: {result}")
-        uuid = result.removeprefix("+OK ").strip()
-        assert_ok(self, f"uuid_broadcast {uuid} silence_stream://-1 aleg")
-        return uuid
+        self.uuid = result.removeprefix("+OK ").strip()
+        assert_ok(self, f"uuid_broadcast {self.uuid} silence_stream://-1 aleg")
+
+    def start_read_tone(self, frequency=700):
+        source = f"tone_stream://%(10000,0,{frequency});loops=-1"
+        assert_ok(self, f"uuid_displace {self.uuid} start {source} 0 rm")
+        return source
+
+    def assert_no_module_errors(self):
+        with FREESWITCH_LOG.open("rb") as log:
+            log.seek(self.freeswitch_log_start)
+            lines = log.read().decode("utf-8", errors="replace").splitlines()
+        errors = [
+            line
+            for line in lines
+            if "[ERR]" in line and any(source in line for source in MODULE_LOG_SOURCES)
+        ]
+        self.assertEqual(errors, [], "module logged errors on a successful path:\n" + "\n".join(errors))
+
+    def expect_no_module_errors(self):
+        self.check_module_errors = True
 
     def start_stream(
         self,
@@ -193,9 +241,10 @@ class ModuleIntegrationTest(unittest.TestCase):
         start_muted=True,
         stream_api="uuid_openai_audio_stream",
         playback_rate=None,
+        mix_type="mono",
     ):
         before = len(mock_events())
-        command = f"{stream_api} {self.uuid} start {url} mono 24k"
+        command = f"{stream_api} {self.uuid} start {url} {mix_type} 24k"
         if playback_rate is not None:
             command += f" {playback_rate}"
         if start_muted:
@@ -206,7 +255,9 @@ class ModuleIntegrationTest(unittest.TestCase):
         return connected
 
     def start_recording(self, scenario):
-        self.recording = Path(f"/tmp/mod-openai-{scenario}-{self.uuid}.wav")
+        recording_dir = ARTIFACT_DIR or Path("/tmp")
+        recording_dir.mkdir(parents=True, exist_ok=True)
+        self.recording = recording_dir / f"mod-openai-{scenario}-{self.uuid}.wav"
         self.recording.unlink(missing_ok=True)
         assert_ok(self, f"uuid_record {self.uuid} start {self.recording}")
 
@@ -252,10 +303,16 @@ class ModuleIntegrationTest(unittest.TestCase):
             "FreeSWITCH did not create the playback recording",
         )
         sample_rate, samples = read_mono_pcm16(self.recording)
+        duration = audible_duration(samples, sample_rate)
         self.assertGreater(
-            audible_duration(samples, sample_rate),
+            duration,
             expected_duration_seconds - PLAYBACK_DURATION_TOLERANCE_SECONDS,
             "recording contains less audible audio than the mock sent",
+        )
+        self.assertLess(
+            duration,
+            expected_duration_seconds + PLAYBACK_DURATION_TOLERANCE_SECONDS,
+            "recording contains more audible audio than the mock sent",
         )
         frequency = dominant_frequency(samples, sample_rate)
         self.assertAlmostEqual(frequency, expected_frequency, delta=75)
@@ -268,6 +325,7 @@ class ModuleIntegrationTest(unittest.TestCase):
         assert_ok(self, f"uuid_openai_audio_stream {self.uuid} unmute openai")
 
         self.stop_stream({"type": "integration.final", "marker": "stop-payload"})
+        self.expect_no_module_errors()
 
     def test_caller_audio_reaches_websocket(self):
         before = len(mock_events())
@@ -277,12 +335,14 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertGreater(audio["size"], 0, "module sent an empty audio payload")
         self.assertTrue(audio["sample_aligned"], "module sent a partial PCM16 sample")
         self.stop_stream()
+        self.expect_no_module_errors()
 
     def test_capture_buffering_and_user_mute(self):
         capture_rate = 24000
         buffer_ms = 100
         aggregated_size = capture_rate * buffer_ms // 1000 * PCM16_BYTES_PER_SAMPLE
         mute_silence_size = capture_rate * PCM16_BYTES_PER_SAMPLE
+        self.start_read_tone()
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_BUFFER_SIZE {buffer_ms}")
 
         before = len(mock_events())
@@ -292,6 +352,11 @@ class ModuleIntegrationTest(unittest.TestCase):
             before,
         )
         self.assertIsNotNone(aggregated, "capture audio was not aggregated to the configured duration")
+        self.assertGreaterEqual(
+            aggregated["peak_amplitude"],
+            AUDIBLE_SAMPLE_THRESHOLD,
+            "audible caller audio was not captured",
+        )
 
         before = len(mock_events())
         assert_ok(self, f"uuid_openai_audio_stream {self.uuid} mute user")
@@ -300,6 +365,7 @@ class ModuleIntegrationTest(unittest.TestCase):
             before,
         )
         self.assertIsNotNone(mute_silence, "muting did not send one second of silence")
+        self.assertTrue(mute_silence["all_zero"], "muting sent non-silent PCM data")
 
         muted_since = len(mock_events())
         time.sleep(0.25)
@@ -315,6 +381,33 @@ class ModuleIntegrationTest(unittest.TestCase):
             before,
         )
         self.assertIsNotNone(resumed, "capture audio did not resume after unmute")
+        self.assertGreaterEqual(
+            resumed["peak_amplitude"],
+            AUDIBLE_SAMPLE_THRESHOLD,
+            "audible caller audio did not resume after unmute",
+        )
+        self.stop_stream()
+        self.expect_no_module_errors()
+
+    def test_stereo_capture_preserves_channel_separation(self):
+        self.start_read_tone()
+        path = "/stereo-capture"
+        before = len(mock_events())
+        self.start_stream(f"{MOCK_URL}{path}", start_muted=False, mix_type="stereo")
+        captured = wait_for_event(
+            lambda event: event.get("event") == "audio-received"
+            and event.get("path") == path
+            and len(event.get("channel_peak_amplitudes", [])) == 2,
+            before,
+        )
+        self.assertIsNotNone(captured, "module did not send interleaved stereo capture")
+        caller_peak, callee_peak = captured["channel_peak_amplitudes"]
+        self.assertGreaterEqual(
+            caller_peak,
+            AUDIBLE_SAMPLE_THRESHOLD,
+            "caller channel did not contain the test tone",
+        )
+        self.assertLess(callee_peak, AUDIBLE_SAMPLE_THRESHOLD, "caller tone leaked into the callee channel")
         self.stop_stream()
 
     def test_extra_headers_merge_with_authorization(self):
@@ -331,6 +424,7 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertEqual(connected["authorization_headers"], ["Bearer integration-test-key"])
         self.assertEqual(connected["integration_headers"], ["preserved"])
         self.stop_stream()
+        self.expect_no_module_errors()
 
     def test_playback_audio_reaches_channel(self):
         self.start_stream()
@@ -346,6 +440,7 @@ class ModuleIntegrationTest(unittest.TestCase):
 
         self.assert_recording_contains_tone(sent["frequency"], sent["duration_seconds"])
         self.stop_stream()
+        self.expect_no_module_errors()
 
     def test_reused_response_id_does_not_suppress_new_playback(self):
         self.start_stream()
@@ -367,6 +462,7 @@ class ModuleIntegrationTest(unittest.TestCase):
 
         self.assert_recording_contains_tone(sent["frequency"], sent["duration_seconds"])
         self.stop_stream()
+        self.expect_no_module_errors()
 
     def test_playback_recovers_from_repeated_underruns(self):
         self.start_stream(f"{MOCK_URL}/underrun")
@@ -395,6 +491,7 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertLess(active_time, expected_active_time * 1.5, "playback repeated or stretched underrun audio")
         self.assertAlmostEqual(dominant_frequency(samples, sample_rate), sent["frequency"], delta=75)
         self.stop_stream()
+        self.expect_no_module_errors()
 
     def test_barge_in_discards_buffered_audio(self):
         self.start_stream(f"{MOCK_URL}/barge-in")
@@ -423,6 +520,7 @@ class ModuleIntegrationTest(unittest.TestCase):
             "replacement audio following barge-in did not reach the channel",
         )
         self.stop_stream()
+        self.expect_no_module_errors()
 
     def test_debug_audio_file_is_private_and_removed_on_stop(self):
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_DISABLE_AUDIOFILES false")
@@ -455,6 +553,7 @@ class ModuleIntegrationTest(unittest.TestCase):
 
         self.stop_stream()
         self.assertTrue(wait_until(lambda: not debug_file.exists()), "debug WAV survived stream teardown")
+        self.expect_no_module_errors()
 
     def test_raw_audio_streams_binary_pcm_in_both_directions(self):
         stream_api = "uuid_raw_audio_stream"
@@ -498,6 +597,7 @@ class ModuleIntegrationTest(unittest.TestCase):
             "regular binary playback was truncated",
         )
         self.stop_stream(stream_api=stream_api)
+        self.expect_no_module_errors()
 
     def test_double_start_is_rejected(self):
         self.start_stream()
@@ -508,6 +608,7 @@ class ModuleIntegrationTest(unittest.TestCase):
         for _ in range(10):
             self.start_stream()
             self.stop_stream()
+        self.expect_no_module_errors()
 
     def test_hangup_while_streaming(self):
         self.start_stream()
@@ -516,6 +617,30 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.uuid = None
         disconnected = wait_for_event(lambda event: event.get("event") == "disconnected", before)
         self.assertIsNotNone(disconnected, "WebSocket did not disconnect after channel hangup")
+        self.expect_no_module_errors()
+
+    def test_reconnects_after_transient_peer_failure(self):
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT false")
+        before = len(mock_events())
+        first_connection = self.start_stream(f"{MOCK_URL}/reconnect")
+        self.assertEqual(first_connection["connection_number"], 1)
+
+        reconnected = wait_for_event(
+            lambda event: event.get("event") == "connected"
+            and event.get("path") == "/reconnect"
+            and event.get("connection_number") == 2,
+            before,
+            timeout=10,
+        )
+        self.assertIsNotNone(reconnected, "module did not reconnect after a transient peer failure")
+
+        before = len(mock_events())
+        request = encode_json({"type": "response.create"})
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
+        response = wait_for_event(lambda event: event.get("event") == "audio-response-sent", before)
+        self.assertIsNotNone(response, "reconnected WebSocket did not receive messages")
+        self.stop_stream()
+        self.expect_no_module_errors()
 
     def test_immediate_peer_close_without_reconnect(self):
         before = len(mock_events())

@@ -43,4 +43,14 @@ docker_build \
     --build-arg "INTEGRATION_BASE_IMAGE=${base_image}" \
     --tag "${test_image}" \
     "${project_dir}"
-docker run --rm "${test_image}"
+
+if [ -n "${TEST_ARTIFACT_DIR:-}" ]; then
+    mkdir -p "${TEST_ARTIFACT_DIR}"
+    artifact_dir=$(CDPATH= cd -- "${TEST_ARTIFACT_DIR}" && pwd)
+    docker run --rm \
+        --env TEST_ARTIFACT_DIR=/test-artifacts \
+        --volume "${artifact_dir}:/test-artifacts:Z" \
+        "${test_image}"
+else
+    docker run --rm "${test_image}"
+fi

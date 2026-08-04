@@ -35,8 +35,8 @@ cd build/tests
 ctest --output-on-failure --no-tests=error
 ```
 
-These tests compile the same `stream_protocol.cpp` and `base64.cpp` files linked into the FreeSWITCH module. No copied
-implementations or fake FreeSWITCH headers are used.
+These tests compile the same `stream_protocol.cpp`, `base64.cpp`, and `playback_queue.cpp` files linked into the
+FreeSWITCH module. No copied implementations or fake FreeSWITCH headers are used.
 
 ## Integration tests
 
@@ -50,7 +50,9 @@ barge-in buffer clearing, and the private lifecycle of temporary debug WAV files
 reuses `response_id` for a later response and verifies that the peer-provided ID does not suppress valid playback
 audio.
 Raw mode is covered in both directions, including binary PCM playback split across odd WebSocket frame boundaries.
-Capture tests verify configured packet aggregation, user mute/unmute semantics, and WebSocket header precedence.
+Capture tests verify configured packet aggregation, mono/stereo channel separation, user mute/unmute semantics, and
+WebSocket header precedence.
+The suite also checks automatic reconnection and rejects malformed or sample-misaligned data observed by the mock.
 
 ```sh
 ./tests/run-integration.sh
@@ -73,6 +75,8 @@ INTEGRATION_BASE_IMAGE=mod-openai-realtime-integration:local ./tests/run-integra
 `INTEGRATION_BASE_IMAGE` can also select another published tag or digest.
 `TEST_IMAGE` controls the local runner image name. The previous `INTEGRATION_IMAGE` override remains supported as an
 alias for `TEST_IMAGE`.
+Set `TEST_ARTIFACT_DIR` to retain mock events, FreeSWITCH logs, and playback recordings. GitHub Actions enables this
+automatically and uploads the directory for seven days only when the test job fails.
 
 `tests/run-ci.sh` is an internal container entry point shared by local Docker runs and GitHub Actions; do not invoke
 it directly on the host. It runs the sanitized unit suite, builds and installs a sanitized module, and then starts
