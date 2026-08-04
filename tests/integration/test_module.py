@@ -63,6 +63,15 @@ def wait_for_event(predicate, start_index=0, timeout=5):
     return None
 
 
+def wait_until(predicate, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def encode_json(payload):
     compact = json.dumps(payload, separators=(",", ":")).encode()
     return base64.b64encode(compact).decode()
@@ -125,6 +134,36 @@ def wait_for_realtime_playback(duration_seconds):
     time.sleep(duration_seconds + PLAYBACK_DRAIN_MARGIN_SECONDS)
 
 
+def active_runs(samples, sample_rate, window_ms=5, threshold=500):
+    window_size = max(sample_rate * window_ms // 1000, 1)
+    runs = 0
+    active = False
+    active_windows = 0
+    for offset in range(0, len(samples) - window_size + 1, window_size):
+        window = samples[offset : offset + window_size]
+        mean_square = sum(sample * sample for sample in window) / len(window)
+        window_active = mean_square >= threshold**2
+        if window_active:
+            active_windows += 1
+            if not active:
+                runs += 1
+        active = window_active
+    return runs, active_windows * window_size / sample_rate
+
+
+def tone_durations(samples, sample_rate, frequencies, window_ms=20, threshold=500):
+    window_size = max(sample_rate * window_ms // 1000, 1)
+    windows = {frequency: 0 for frequency in frequencies}
+    for offset in range(0, len(samples) - window_size + 1, window_size):
+        window = samples[offset : offset + window_size]
+        mean_square = sum(sample * sample for sample in window) / len(window)
+        if mean_square < threshold**2:
+            continue
+        winner = max(frequencies, key=lambda frequency: goertzel_power(window, sample_rate, frequency))
+        windows[winner] += 1
+    return {frequency: count * window_size / sample_rate for frequency, count in windows.items()}
+
+
 class ModuleIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.uuid = self.originate_call()
@@ -155,6 +194,16 @@ class ModuleIntegrationTest(unittest.TestCase):
         assert_ok(self, command)
         connected = wait_for_event(lambda event: event.get("event") == "connected", before)
         self.assertIsNotNone(connected, "module did not connect to the mock WebSocket server")
+
+    def start_recording(self, scenario):
+        self.recording = Path(f"/tmp/mod-openai-{scenario}-{self.uuid}.wav")
+        self.recording.unlink(missing_ok=True)
+        assert_ok(self, f"uuid_record {self.uuid} start {self.recording}")
+
+    def stop_recording(self):
+        assert_ok(self, f"uuid_record {self.uuid} stop {self.recording}")
+        self.assertTrue(self.recording.exists(), "FreeSWITCH did not create the playback recording")
+        return read_mono_pcm16(self.recording)
 
     def stop_stream(self, final_payload=None):
         before = len(mock_events())
@@ -221,9 +270,7 @@ class ModuleIntegrationTest(unittest.TestCase):
 
     def test_playback_audio_reaches_channel(self):
         self.start_stream()
-        self.recording = Path(f"/tmp/mod-openai-playback-{self.uuid}.wav")
-        self.recording.unlink(missing_ok=True)
-        assert_ok(self, f"uuid_record {self.uuid} start {self.recording}")
+        self.start_recording("playback")
 
         before = len(mock_events())
         request = encode_json({"type": "response.create"})
@@ -231,16 +278,14 @@ class ModuleIntegrationTest(unittest.TestCase):
         sent = wait_for_event(lambda event: event.get("event") == "audio-response-sent", before)
         self.assertIsNotNone(sent, "mock playback tone was not delivered")
         wait_for_realtime_playback(sent["duration_seconds"])
-        assert_ok(self, f"uuid_record {self.uuid} stop {self.recording}")
+        self.stop_recording()
 
         self.assert_recording_contains_tone(sent["frequency"], sent["duration_seconds"])
         self.stop_stream()
 
     def test_reused_response_id_does_not_suppress_new_playback(self):
         self.start_stream()
-        self.recording = Path(f"/tmp/mod-openai-response-id-{self.uuid}.wav")
-        self.recording.unlink(missing_ok=True)
-        assert_ok(self, f"uuid_record {self.uuid} start {self.recording}")
+        self.start_recording("response-id")
 
         before = len(mock_events())
         request = encode_json({"type": "integration.reused_response_id"})
@@ -254,10 +299,98 @@ class ModuleIntegrationTest(unittest.TestCase):
             "mock did not send audio with the reused response_id",
         )
         wait_for_realtime_playback(sent["duration_seconds"])
-        assert_ok(self, f"uuid_record {self.uuid} stop {self.recording}")
+        self.stop_recording()
 
         self.assert_recording_contains_tone(sent["frequency"], sent["duration_seconds"])
         self.stop_stream()
+
+    def test_playback_recovers_from_repeated_underruns(self):
+        self.start_stream(f"{MOCK_URL}/underrun")
+        self.start_recording("underrun")
+
+        before = len(mock_events())
+        request = encode_json({"type": "response.create"})
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
+        sent = wait_for_event(lambda event: event.get("event") == "underrun-response-sent", before, timeout=10)
+        self.assertIsNotNone(sent, "mock underrun sequence was not delivered")
+        time.sleep(0.2)
+        sample_rate, samples = self.stop_recording()
+        recording_duration = len(samples) / sample_rate
+        self.assertGreater(
+            recording_duration,
+            sent["elapsed"] + 0.1,
+            "short replacement frames compressed the recorded playback timeline",
+        )
+
+        # Use analysis windows shorter than each 5 ms burst: otherwise a burst crossing a
+        # window boundary can be counted as 10 ms and make the upper bound timing-dependent.
+        runs, active_time = active_runs(samples, sample_rate, window_ms=1)
+        expected_active_time = sent["burst_count"] * sent["burst_duration"]
+        self.assertGreaterEqual(runs, sent["burst_count"] - 4, "playback did not recover after repeated underruns")
+        self.assertGreater(active_time, expected_active_time * 0.6)
+        self.assertLess(active_time, expected_active_time * 1.5, "playback repeated or stretched underrun audio")
+        self.assertAlmostEqual(dominant_frequency(samples, sample_rate), sent["frequency"], delta=75)
+        self.stop_stream()
+
+    def test_barge_in_discards_buffered_audio(self):
+        self.start_stream(f"{MOCK_URL}/barge-in")
+        self.start_recording("barge-in")
+
+        before = len(mock_events())
+        request = encode_json({"type": "response.create"})
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
+        sent = wait_for_event(lambda event: event.get("event") == "barge-in-response-sent", before)
+        self.assertIsNotNone(sent, "mock barge-in sequence was not delivered")
+        time.sleep(0.9)
+        sample_rate, samples = self.stop_recording()
+        durations = tone_durations(
+            samples,
+            sample_rate,
+            (sent["interrupted_frequency"], sent["replacement_frequency"]),
+        )
+        self.assertLess(
+            durations[sent["interrupted_frequency"]],
+            0.5,
+            "audio queued before barge-in was still played",
+        )
+        self.assertGreater(
+            durations[sent["replacement_frequency"]],
+            0.4,
+            "replacement audio following barge-in did not reach the channel",
+        )
+        self.stop_stream()
+
+    def test_debug_audio_file_is_private_and_removed_on_stop(self):
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_DISABLE_AUDIOFILES false")
+        self.start_stream(f"{MOCK_URL}/debug-audio")
+
+        temp_dir = Path(api("global_getvar temp_dir"))
+        debug_file = temp_dir / f"{self.uuid}_0.tmp.wav"
+        debug_file.unlink(missing_ok=True)
+        before = len(mock_events())
+        request = encode_json({"type": "response.create"})
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
+        sent = wait_for_event(lambda event: event.get("event") == "debug-audio-response-sent", before)
+        self.assertIsNotNone(sent, "mock debug-audio response was not delivered")
+
+        def debug_wav_is_complete():
+            try:
+                with wave.open(str(debug_file), "rb") as recording:
+                    return len(recording.readframes(recording.getnframes())) == sent["byte_count"]
+            except (EOFError, FileNotFoundError, wave.Error):
+                return False
+
+        self.assertTrue(wait_until(debug_wav_is_complete), "module did not finish writing the debug WAV file")
+
+        self.assertEqual(debug_file.stat().st_mode & 0o777, 0o600, "debug audio is not owner-only")
+        with wave.open(str(debug_file), "rb") as recording:
+            self.assertEqual(recording.getnchannels(), 1)
+            self.assertEqual(recording.getsampwidth(), 2)
+            self.assertEqual(recording.getframerate(), sent["sample_rate"])
+            self.assertEqual(recording.getnframes() * recording.getsampwidth(), sent["byte_count"])
+
+        self.stop_stream()
+        self.assertTrue(wait_until(lambda: not debug_file.exists()), "debug WAV survived stream teardown")
 
     def test_double_start_is_rejected(self):
         self.start_stream()

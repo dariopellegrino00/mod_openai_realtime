@@ -5,15 +5,16 @@ import base64
 import json
 import math
 import struct
+import time
 from pathlib import Path
 
 import websockets
 
 
-def pcm16_tone(sample_rate, frequency, duration_seconds, amplitude=12000):
+def pcm16_tone(sample_rate, frequency, duration_seconds, amplitude=12000, start_sample=0):
     sample_count = int(sample_rate * duration_seconds)
     samples = (
-        int(amplitude * math.sin(2 * math.pi * frequency * index / sample_rate))
+        int(amplitude * math.sin(2 * math.pi * frequency * (start_sample + index) / sample_rate))
         for index in range(sample_count)
     )
     return struct.pack(f"<{sample_count}h", *samples)
@@ -74,11 +75,29 @@ class MockRealtimeServer:
                 if message_type == "session.update":
                     await websocket.send(json.dumps({"type": "session.updated", "session": payload.get("session", {})}))
                 elif message_type == "response.create":
-                    await self.send_audio_response(websocket)
+                    if path == "/underrun":
+                        await self.send_underrun_response(websocket)
+                    elif path == "/barge-in":
+                        await self.send_barge_in_response(websocket)
+                    elif path == "/debug-audio":
+                        await self.send_debug_audio_response(websocket)
+                    else:
+                        await self.send_audio_response(websocket)
                 elif message_type == "integration.reused_response_id":
                     await self.send_reused_response_id_audio(websocket)
         finally:
             await self.record("disconnected", path=path)
+
+    async def send_audio_delta(self, websocket, response_id, audio):
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": response_id,
+                    "delta": base64.b64encode(audio).decode("ascii"),
+                }
+            )
+        )
 
     async def send_audio_response(self, websocket):
         sample_rate = 24000
@@ -87,22 +106,13 @@ class MockRealtimeServer:
         audio = pcm16_tone(sample_rate, frequency, duration_seconds)
         chunk_sizes = (137, 521, 1003, 269, 1607)
         response_id = "integration-response"
-
         await websocket.send(json.dumps({"type": "input_audio_buffer.speech_started"}))
         offset = 0
         chunk_index = 0
         while offset < len(audio):
             chunk_size = chunk_sizes[chunk_index % len(chunk_sizes)] * 2
             chunk = audio[offset : offset + chunk_size]
-            await websocket.send(
-                json.dumps(
-                    {
-                        "type": "response.output_audio.delta",
-                        "response_id": response_id,
-                        "delta": base64.b64encode(chunk).decode("ascii"),
-                    }
-                )
-            )
+            await self.send_audio_delta(websocket, response_id, chunk)
             offset += len(chunk)
             chunk_index += 1
 
@@ -122,15 +132,7 @@ class MockRealtimeServer:
         # Complete one response, interrupt playback, and reuse its ID for a later response.
         # The peer-provided ID must not suppress otherwise valid playback audio.
         prime_audio = pcm16_tone(sample_rate, frequency=700, duration_seconds=0.04)
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "response.output_audio.delta",
-                    "response_id": response_id,
-                    "delta": base64.b64encode(prime_audio).decode("ascii"),
-                }
-            )
-        )
+        await self.send_audio_delta(websocket, response_id, prime_audio)
         await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
         await websocket.send(json.dumps({"type": "input_audio_buffer.speech_started"}))
         await websocket.send(json.dumps({"type": "input_audio_buffer.speech_stopped"}))
@@ -138,15 +140,7 @@ class MockRealtimeServer:
         frequency = 1400
         duration_seconds = 0.6
         replacement_audio = pcm16_tone(sample_rate, frequency, duration_seconds)
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "response.output_audio.delta",
-                    "response_id": response_id,
-                    "delta": base64.b64encode(replacement_audio).decode("ascii"),
-                }
-            )
-        )
+        await self.send_audio_delta(websocket, response_id, replacement_audio)
         await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
         await self.record(
             "reused-response-id-audio-sent",
@@ -154,6 +148,81 @@ class MockRealtimeServer:
             frequency=frequency,
             duration_seconds=duration_seconds,
         )
+
+    async def send_underrun_response(self, websocket):
+        sample_rate = 24000
+        frequency = 1000
+        burst_duration = 0.005
+        burst_interval = 0.05
+        burst_count = 24
+        response_id = "integration-underrun-response"
+        samples_per_burst = int(sample_rate * burst_duration)
+        started_at = time.monotonic()
+
+        for burst_index in range(burst_count):
+            audio = pcm16_tone(
+                sample_rate,
+                frequency,
+                burst_duration,
+                start_sample=burst_index * samples_per_burst,
+            )
+            await self.send_audio_delta(websocket, response_id, audio)
+            if burst_index + 1 < burst_count:
+                await asyncio.sleep(burst_interval)
+
+        await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
+        await self.record(
+            "underrun-response-sent",
+            response_id=response_id,
+            frequency=frequency,
+            burst_count=burst_count,
+            burst_duration=burst_duration,
+            burst_interval=burst_interval,
+            elapsed=time.monotonic() - started_at,
+        )
+
+    async def send_barge_in_response(self, websocket):
+        sample_rate = 24000
+        interrupted_frequency = 700
+        replacement_frequency = 1400
+        interrupted_response_id = "integration-interrupted-response"
+        replacement_response_id = "integration-replacement-response"
+
+        # Queue much more audio than can play before the interruption. This makes the test
+        # distinguish a real buffer clear from merely accepting the speech_started message.
+        await self.send_audio_delta(
+            websocket,
+            interrupted_response_id,
+            pcm16_tone(sample_rate, interrupted_frequency, 2.0),
+        )
+        await asyncio.sleep(0.25)
+        await websocket.send(json.dumps({"type": "input_audio_buffer.speech_started"}))
+        await websocket.send(
+            json.dumps({"type": "response.output_audio.done", "response_id": interrupted_response_id})
+        )
+
+        # The clear must discard the buffered audio without suppressing subsequent playback.
+        await self.send_audio_delta(
+            websocket,
+            replacement_response_id,
+            pcm16_tone(sample_rate, replacement_frequency, 0.5),
+        )
+        await websocket.send(
+            json.dumps({"type": "response.output_audio.done", "response_id": replacement_response_id})
+        )
+        await self.record(
+            "barge-in-response-sent",
+            interrupted_frequency=interrupted_frequency,
+            replacement_frequency=replacement_frequency,
+        )
+
+    async def send_debug_audio_response(self, websocket):
+        sample_rate = 24000
+        response_id = "integration-debug-audio-response"
+        audio = pcm16_tone(sample_rate, 1000, 0.1)
+        await self.send_audio_delta(websocket, response_id, audio)
+        await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
+        await self.record("debug-audio-response-sent", sample_rate=sample_rate, byte_count=len(audio))
 
     async def run(self, host, port):
         self.event_log.unlink(missing_ok=True)
