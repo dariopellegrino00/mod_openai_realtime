@@ -184,6 +184,9 @@ class AudioStreamer {
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
                               "(%s) Dropping oversized %s WebSocket message (%zu bytes, max %d)\n", m_sessionId.c_str(),
                               message->binary ? "binary" : "text", message->str.size(), MAX_WS_MESSAGE_BYTES);
+            if (message->binary && m_raw_audio_mode) {
+                resetPlaybackDecoderState();
+            }
             return;
         }
 
@@ -211,8 +214,8 @@ class AudioStreamer {
     }
 
     void handleConnectionOpen() {
-        // A new connection starts a new PCM stream: forget any half-sample carried over.
-        m_has_pending_raw_byte = false;
+        // A new connection starts a new PCM stream.
+        resetPlaybackDecoderState();
 
         cJSON *root = cJSON_CreateObject();
         if (root) {
@@ -487,11 +490,12 @@ class AudioStreamer {
                           m_sessionId.c_str());
         m_playback_queue.clear();
         request_playback_clear();
+        m_response_audio_done = true;
+        resetPlaybackDecoderState();
     }
 
     switch_bool_t handleAudioDelta(switch_core_session_t *session, cJSON *json, std::string& message) {
         const char *json_audio = cJSON_GetObjectCstr(json, "delta");
-        m_response_audio_done = false;
         if (!json_audio || *json_audio == '\0') {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                               "(%s) processMessage - response.output_audio.delta no audio data\n", m_sessionId.c_str());
@@ -536,6 +540,7 @@ class AudioStreamer {
         if (resampled.empty()) {
             return SWITCH_FALSE;
         }
+        m_response_audio_done = false;
         push_audio_queue(std::move(resampled));
         return SWITCH_TRUE;
     }
@@ -579,6 +584,7 @@ class AudioStreamer {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
                                   "(%s) processMessage - audio done\n", m_sessionId.c_str());
                 m_response_audio_done = true;
+                resetPlaybackDecoderState();
                 break;
             case stream_protocol::JsonMessageType::Unhandled:
                 break;
@@ -600,6 +606,18 @@ class AudioStreamer {
 
     bool pop_audio_queue(std::vector<int16_t>& out_audio) {
         return m_playback_queue.pop(out_audio);
+    }
+
+    void resetPlaybackDecoderState() {
+        m_pending_raw_byte = 0;
+        m_has_pending_raw_byte = false;
+        if (m_resampler) {
+            const int result = speex_resampler_reset_mem(m_resampler);
+            if (result != RESAMPLER_ERR_SUCCESS) {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "(%s) failed to reset playback resampler: %s\n",
+                                  m_sessionId.c_str(), speex_resampler_strerror(result));
+            }
+        }
     }
 
     ~AudioStreamer() {

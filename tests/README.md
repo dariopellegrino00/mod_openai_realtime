@@ -46,10 +46,13 @@ they are built from the current checkout and executed every time the container s
 
 The mock server sends known PCM16 tones which are recorded from the FreeSWITCH channel and analysed for timing,
 audible duration, and dominant frequency. The playback tests exercise normal delivery, repeated buffer underruns,
-barge-in buffer clearing, and the private lifecycle of temporary debug WAV files. A compatibility scenario also
-reuses `response_id` for a later response and verifies that the peer-provided ID does not suppress valid playback
-audio.
+pause/resume and mute/unmute, public speech lifecycle events, barge-in buffer clearing, and the private lifecycle of
+temporary debug WAV files. A compatibility scenario also reuses `response_id` for a later response and verifies that
+the peer-provided ID does not suppress valid playback audio. Invalid audio deltas received after completion must not
+suppress the final playback-stop event. Peer-close cleanup is also verified while playback is paused.
 Raw mode is covered in both directions, including binary PCM playback split across odd WebSocket frame boundaries.
+The raw playback suite verifies that PCM carry and resampler state do not cross an interrupted stream boundary, and
+that PCM carry is reset after a discarded oversized binary frame.
 Capture tests verify configured packet aggregation, mono/stereo channel separation, user mute/unmute semantics, and
 WebSocket header precedence.
 The suite also checks automatic reconnection and rejects malformed or sample-misaligned data observed by the mock.

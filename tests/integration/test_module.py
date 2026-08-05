@@ -336,15 +336,18 @@ class ModuleIntegrationTest(unittest.TestCase):
         assert_ok(self, f"uuid_displace {self.uuid} start {source} 0 rm")
         return source
 
-    def assert_no_module_errors(self):
+    def module_error_lines(self):
         with FREESWITCH_LOG.open("rb") as log:
             log.seek(self.freeswitch_log_start)
             lines = log.read().decode("utf-8", errors="replace").splitlines()
-        errors = [
+        return [
             line
             for line in lines
             if "[ERR]" in line and any(source in line for source in MODULE_LOG_SOURCES)
         ]
+
+    def assert_no_module_errors(self):
+        errors = self.module_error_lines()
         self.assertEqual(errors, [], "module logged errors on a successful path:\n" + "\n".join(errors))
 
     def expect_no_module_errors(self):
@@ -493,6 +496,34 @@ class ModuleIntegrationTest(unittest.TestCase):
             )
         self.stop_stream()
         self.expect_no_module_errors()
+
+    def test_invalid_audio_delta_does_not_reopen_completed_playback(self):
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            self.start_stream(f"{MOCK_URL}/invalid-delta-after-done")
+            before = len(mock_events())
+            request = encode_json({"type": "response.create"})
+            assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
+            sent = wait_for_event(
+                lambda event: event.get("event") == "invalid-delta-after-done-sent",
+                before,
+            )
+            self.assertIsNotNone(sent, "mock invalid audio delta sequence was not delivered")
+
+            started = event_socket.wait_for(SPEECH_START_EVENT)
+            stopped = event_socket.wait_for(SPEECH_STOP_EVENT, timeout=sent["duration_seconds"] + 3)
+            self.assertIsNotNone(
+                started,
+                f"module did not emit playback-start; observed {event_socket.seen_events}",
+            )
+            self.assertIsNotNone(
+                stopped,
+                f"invalid audio delta suppressed playback-stop; observed {event_socket.seen_events}",
+            )
+
+        self.stop_stream()
+        errors = self.module_error_lines()
+        self.assertEqual(len(errors), 1, f"unexpected module errors: {errors}")
+        self.assertIn("response.output_audio.delta no audio data", errors[0])
 
     def test_caller_audio_reaches_websocket(self):
         before = len(mock_events())
@@ -766,6 +797,67 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.stop_stream(stream_api=stream_api)
         self.expect_no_module_errors()
 
+    def test_raw_audio_resets_decoder_state_after_interruption(self):
+        stream_api = "uuid_raw_audio_stream"
+        self.start_stream(
+            f"{MOCK_URL}/raw-audio-boundary",
+            stream_api=stream_api,
+            playback_rate="24k",
+        )
+        self.start_recording("raw-audio-boundary")
+        before = len(mock_events())
+        request = encode_json({"type": "response.create"})
+        assert_ok(self, f"{stream_api} {self.uuid} send_json {request}")
+        sent = wait_for_event(
+            lambda event: event.get("event") == "raw-audio-boundary-response-sent",
+            before,
+        )
+        self.assertIsNotNone(sent, "mock raw-audio boundary response was not delivered")
+        time.sleep(0.65)
+        sample_rate, samples = self.stop_recording()
+        self.assertGreater(audible_duration(samples, sample_rate), 0.35)
+        self.assertAlmostEqual(
+            dominant_frequency(samples, sample_rate),
+            sent["replacement_frequency"],
+            delta=75,
+            msg="PCM carry or resampler state leaked across the interrupted stream",
+        )
+        self.stop_stream(stream_api=stream_api)
+        self.expect_no_module_errors()
+
+    def test_raw_audio_resets_decoder_state_after_oversized_frame(self):
+        stream_api = "uuid_raw_audio_stream"
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            self.start_stream(
+                f"{MOCK_URL}/raw-audio-oversized-boundary",
+                stream_api=stream_api,
+                playback_rate="24k",
+            )
+            self.start_recording("raw-audio-oversized-boundary")
+            before = len(mock_events())
+            request = encode_json({"type": "response.create"})
+            assert_ok(self, f"{stream_api} {self.uuid} send_json {request}")
+            sent = wait_for_event(
+                lambda event: event.get("event") == "raw-audio-oversized-boundary-response-sent",
+                before,
+            )
+            self.assertIsNotNone(sent, "mock oversized raw-audio response was not delivered")
+            stopped = event_socket.wait_for(SPEECH_STOP_EVENT)
+            self.assertIsNotNone(
+                stopped,
+                f"raw playback did not stop after the oversized frame; observed {event_socket.seen_events}",
+            )
+            sample_rate, samples = self.stop_recording()
+
+        self.assertGreater(audible_duration(samples, sample_rate), 0.35)
+        self.assertAlmostEqual(
+            dominant_frequency(samples, sample_rate),
+            sent["replacement_frequency"],
+            delta=75,
+            msg="PCM carry crossed an oversized raw frame",
+        )
+        self.stop_stream(stream_api=stream_api)
+
     def test_double_start_is_rejected(self):
         self.start_stream()
         assert_error(self, f"uuid_openai_audio_stream {self.uuid} start {MOCK_URL} mono 24k mute_user")
@@ -806,6 +898,44 @@ class ModuleIntegrationTest(unittest.TestCase):
         assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
         response = wait_for_event(lambda event: event.get("event") == "audio-response-sent", before)
         self.assertIsNotNone(response, "reconnected WebSocket did not receive messages")
+        self.stop_stream()
+        self.expect_no_module_errors()
+
+    def test_reconnect_preserves_completed_playback_lifecycle(self):
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT false")
+            before = len(mock_events())
+            first_connection = self.start_stream(f"{MOCK_URL}/reconnect-during-playback")
+            self.assertEqual(first_connection["connection_number"], 1)
+
+            request = encode_json({"type": "response.create"})
+            assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
+            sent = wait_for_event(
+                lambda event: event.get("event") == "reconnect-playback-response-sent",
+                before,
+            )
+            self.assertIsNotNone(sent, "mock reconnect playback response was not delivered")
+
+            started = event_socket.wait_for(SPEECH_START_EVENT)
+            self.assertIsNotNone(
+                started,
+                f"module did not emit playback-start before reconnect; observed {event_socket.seen_events}",
+            )
+            reconnected = wait_for_event(
+                lambda event: event.get("event") == "connected"
+                and event.get("path") == "/reconnect-during-playback"
+                and event.get("connection_number") == 2,
+                before,
+                timeout=10,
+            )
+            self.assertIsNotNone(reconnected, "module did not reconnect while completed playback was draining")
+
+            stopped = event_socket.wait_for(SPEECH_STOP_EVENT, timeout=sent["duration_seconds"] + 3)
+            self.assertIsNotNone(
+                stopped,
+                f"module lost playback-stop state across reconnect; observed {event_socket.seen_events}",
+            )
+
         self.stop_stream()
         self.expect_no_module_errors()
 

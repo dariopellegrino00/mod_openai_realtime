@@ -113,14 +113,22 @@ class MockRealtimeServer:
                 elif message_type == "response.create":
                     if path == "/underrun":
                         await self.send_underrun_response(websocket)
+                    elif path == "/invalid-delta-after-done":
+                        await self.send_invalid_delta_after_done_response(websocket)
                     elif path == "/barge-in":
                         await self.send_barge_in_response(websocket)
+                    elif path == "/reconnect-during-playback":
+                        await self.send_reconnect_during_playback_response(websocket)
                     elif path == "/flow-control":
                         await self.send_flow_control_response(websocket)
                     elif path == "/debug-audio":
                         await self.send_debug_audio_response(websocket)
                     elif path == "/raw-audio":
                         await self.send_raw_audio_response(websocket)
+                    elif path == "/raw-audio-boundary":
+                        await self.send_raw_audio_boundary_response(websocket)
+                    elif path == "/raw-audio-oversized-boundary":
+                        await self.send_raw_audio_oversized_boundary_response(websocket)
                     else:
                         await self.send_audio_response(websocket)
                 elif message_type == "integration.reused_response_id":
@@ -164,6 +172,45 @@ class MockRealtimeServer:
             frequency=frequency,
             duration_seconds=duration_seconds,
         )
+
+    async def send_invalid_delta_after_done_response(self, websocket):
+        sample_rate = 24000
+        duration_seconds = 1.0
+        response_id = "integration-invalid-delta-after-done"
+        await self.send_audio_delta(
+            websocket,
+            response_id,
+            pcm16_tone(sample_rate, frequency=1000, duration_seconds=duration_seconds),
+        )
+        await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
+        await websocket.send(json.dumps({"type": "response.output_audio.delta", "response_id": response_id}))
+        await self.record(
+            "invalid-delta-after-done-sent",
+            response_id=response_id,
+            duration_seconds=duration_seconds,
+        )
+
+    async def send_reconnect_during_playback_response(self, websocket):
+        sample_rate = 24000
+        frequency = 1100
+        duration_seconds = 2.0
+        response_id = "integration-reconnect-playback-response"
+
+        # Complete the response before dropping the connection. Playback drains in real time,
+        # so the automatic reconnect opens while completed audio is still queued locally.
+        await self.send_audio_delta(
+            websocket,
+            response_id,
+            pcm16_tone(sample_rate, frequency, duration_seconds),
+        )
+        await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
+        await self.record(
+            "reconnect-playback-response-sent",
+            response_id=response_id,
+            frequency=frequency,
+            duration_seconds=duration_seconds,
+        )
+        await websocket.close(code=1011, reason="reconnect while completed playback is draining")
 
     async def send_reused_response_id_audio(self, websocket):
         sample_rate = 24000
@@ -305,6 +352,42 @@ class MockRealtimeServer:
             split_duration=split_duration,
             regular_duration=regular_duration,
             split_frame_count=len(split_audio),
+        )
+
+    async def send_raw_audio_boundary_response(self, websocket):
+        sample_rate = 24000
+        stale_frequency = 1800
+        replacement_frequency = 700
+        replacement_duration = 0.5
+
+        # The orphan byte belongs to the PCM stream interrupted by speech_started. Carrying it
+        # into the next stream shifts every following PCM16 sample by one byte.
+        stale_audio = pcm16_tone(sample_rate, stale_frequency, 0.08) + b"\x7f"
+        await websocket.send(stale_audio)
+        await websocket.send(json.dumps({"type": "input_audio_buffer.speech_started"}))
+        await websocket.send(pcm16_tone(sample_rate, replacement_frequency, replacement_duration))
+        # Deliberately omit response_id: stream-boundary handling must not depend on metadata.
+        await websocket.send(json.dumps({"type": "response.output_audio.done"}))
+        await self.record(
+            "raw-audio-boundary-response-sent",
+            stale_frequency=stale_frequency,
+            replacement_frequency=replacement_frequency,
+            replacement_duration=replacement_duration,
+        )
+
+    async def send_raw_audio_oversized_boundary_response(self, websocket):
+        sample_rate = 24000
+        replacement_frequency = 700
+        replacement_duration = 0.5
+
+        await websocket.send(b"\x7f")
+        await websocket.send(bytes(8 * 1024 * 1024 + 1))
+        await websocket.send(pcm16_tone(sample_rate, replacement_frequency, replacement_duration))
+        await websocket.send(json.dumps({"type": "response.output_audio.done"}))
+        await self.record(
+            "raw-audio-oversized-boundary-response-sent",
+            replacement_frequency=replacement_frequency,
+            replacement_duration=replacement_duration,
         )
 
     async def run(self, host, port):
