@@ -92,19 +92,19 @@ static std::string insert_linebreaks(std::string str, size_t distance) {
     return str;
 }
 
-template <typename String, unsigned int line_length> static std::string encode_with_line_breaks(String s) {
+template <typename String, unsigned int line_length> static std::string encode_with_line_breaks(String const& s) {
     return insert_linebreaks(base64_encode(s, false), line_length);
 }
 
-template <typename String> static std::string encode_pem(String s) {
+template <typename String> static std::string encode_pem(String const& s) {
     return encode_with_line_breaks<String, 64>(s);
 }
 
-template <typename String> static std::string encode_mime(String s) {
+template <typename String> static std::string encode_mime(String const& s) {
     return encode_with_line_breaks<String, 76>(s);
 }
 
-template <typename String> static std::string encode(String s, bool url) {
+template <typename String> static std::string encode(String const& s, bool url) {
     return base64_encode(reinterpret_cast<const unsigned char *>(s.data()), s.length(), url);
 }
 
@@ -112,7 +112,7 @@ std::string base64_encode(unsigned char const *bytes_to_encode, size_t in_len, b
 
     size_t len_encoded = (in_len + 2) / 3 * 4;
 
-    unsigned char trailing_char = url ? '.' : '=';
+    char trailing_char = url ? '.' : '=';
 
     //
     // Choose set of base64 characters. They differ

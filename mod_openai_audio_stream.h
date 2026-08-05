@@ -1,9 +1,11 @@
 #ifndef MOD_OPENAI_AUDIO_STREAM_H
 #define MOD_OPENAI_AUDIO_STREAM_H
 
-#include <switch.h>
 #include <limits.h>
+#include <stdint.h>
+
 #include <speex/speex_resampler.h>
+#include <switch.h>
 
 #define MY_BUG_NAME "audio_stream"
 #define MAX_SESSION_ID (256)
@@ -26,7 +28,7 @@ struct private_data {
     char sessionId[MAX_SESSION_ID];
     SpeexResamplerState *resampler;
     void *cpp_context;
-    int sampling;
+    uint32_t sampling;
     int channels;
     switch_atomic_t audio_paused;
     switch_atomic_t user_audio_muted;

@@ -6,6 +6,8 @@
 
 namespace audio_stream {
 
+// Capacity and maximum chunk size share a unit; the constructor declaration documents their order.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 PlaybackQueue::PlaybackQueue(std::size_t capacity_samples, std::size_t max_chunk_samples)
     : m_capacity_samples(capacity_samples), m_max_chunk_samples(max_chunk_samples) {
     if (m_capacity_samples == 0 || m_max_chunk_samples == 0) {

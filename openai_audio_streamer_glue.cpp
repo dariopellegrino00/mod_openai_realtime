@@ -1,41 +1,42 @@
-#include <string>
-#include <cstring>
 #include "openai_audio_streamer_glue.h"
-#include <ixwebsocket/IXWebSocket.h>
-#include <sstream>
+
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
-#include <atomic>
-#include <cstdint>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include <switch_json.h>
-#include <switch_buffer.h>
-#include <unordered_map>
-#include <unordered_set>
-#include "base64.h"
-#include "playback_queue.h"
-
-#include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "stream_protocol.h"
+#include <ixwebsocket/IXWebSocket.h>
+#include <switch_buffer.h>
+#include <switch_json.h>
 
-#define FRAME_SIZE_8000 320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
-#define MAX_AUDIO_CHUNK_SAMPLES                                                                                        \
-    16384 /* max samples per queue entry (~32KB), keeps chunks within playback buffer capacity */
-#define MAX_PLAYBACK_QUEUE_SECONDS 180 /* overload guard: incoming playback audio beyond this backlog is dropped */
-#define MAX_WS_MESSAGE_BYTES                                                                                           \
-    (8 * 1024 * 1024)              /* overload guard: peer messages beyond this are dropped before copying/parsing */
-#define MAX_JSON_DEPTH 128         /* guards the recursive cJSON parser against deeply nested peer JSON */
-#define MAX_STREAM_BUFFER_MS 1000  /* upper bound for the STREAM_BUFFER_SIZE capture aggregation window */
-#define MAX_HEARTBEAT_SECONDS 3600 /* upper bound for the STREAM_HEART_BEAT ping interval */
+#include "base64.h"
+#include "playback_queue.h"
+#include "stream_protocol.h"
 
 namespace {
 
+// A 20 ms mono PCM16 frame at 8 kHz contains 160 samples, or 320 bytes.
+constexpr std::size_t FRAME_SIZE_8000 = 320;
+constexpr std::size_t MAX_AUDIO_CHUNK_SAMPLES = 16384;
+constexpr std::size_t MAX_PLAYBACK_QUEUE_SECONDS = 180;
+constexpr int MAX_JSON_DEPTH = 128;
+constexpr int MAX_STREAM_BUFFER_MS = 1000;
+constexpr int MAX_HEARTBEAT_SECONDS = 3600;
+// Overload guard: peer messages beyond this are dropped before copying/parsing.
+constexpr std::size_t MAX_WS_MESSAGE_BYTES = std::size_t{8} * 1024U * 1024U;
 constexpr std::size_t PLAYBACK_BUFFER_BYTES = 128000;
 
 struct StreamConfig {
@@ -80,7 +81,8 @@ class AudioStreamer {
   public:
     AudioStreamer(const char *session_id, const StreamConfig& config, private_t *context)
         : m_sessionId(session_id), m_notify(config.response_handler), m_suppress_log(config.suppress_log),
-          m_playFile(0), in_sample_rate(config.playback_input_rate), out_sample_rate(config.playback_output_rate),
+          m_playFile(0), m_playback_input_rate(config.playback_input_rate),
+          m_playback_output_rate(config.playback_output_rate),
           m_playback_queue(static_cast<std::size_t>(config.playback_output_rate) * MAX_PLAYBACK_QUEUE_SECONDS,
                            MAX_AUDIO_CHUNK_SAMPLES),
           m_disable_audiofiles(config.disable_audio_files), m_raw_audio_mode(config.raw_audio_mode),
@@ -129,16 +131,14 @@ class AudioStreamer {
         tlsOptions.disable_hostname_validation = config.disable_tls_hostname_validation;
         webSocket.setTLSOptions(tlsOptions);
 
-        // Optional heart beat, sent every xx seconds when there is not any traffic
-        // to make sure that load balancers do not kill an idle connection.
+        // Keep idle connections alive through intermediaries that enforce inactivity timeouts.
         if (config.heartbeat_seconds)
             webSocket.setPingInterval(config.heartbeat_seconds);
 
-        // Per message deflate connection is enabled by default. You can tweak its parameters or disable it
+        // Per-message deflate is enabled by default.
         if (config.disable_per_message_deflate)
             webSocket.disablePerMessageDeflate();
 
-        // Set extra headers if any
         if (!headers.empty())
             webSocket.setExtraHeaders(headers);
 
@@ -148,14 +148,15 @@ class AudioStreamer {
         webSocket.setOnMessageCallback(
             [this](const ix::WebSocketMessagePtr& message) { handleWebSocketMessage(message); });
 
-        if (in_sample_rate != out_sample_rate) {
+        if (m_playback_input_rate != m_playback_output_rate) {
             int err = 0;
-            m_resampler = speex_resampler_init(1, in_sample_rate, out_sample_rate, SWITCH_RESAMPLE_QUALITY, &err);
+            m_resampler =
+                speex_resampler_init(1, m_playback_input_rate, m_playback_output_rate, SWITCH_RESAMPLE_QUALITY, &err);
             if (!m_resampler || err != RESAMPLER_ERR_SUCCESS) {
                 // convertRawAudio drops incoming audio in this state rather than playing it at the wrong rate
                 switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                                  "(%s) Error initializing playback resampler %d -> %d: %s\n", m_sessionId.c_str(),
-                                  in_sample_rate, out_sample_rate, speex_resampler_strerror(err));
+                                  "(%s) Error initializing playback resampler %u -> %u: %s\n", m_sessionId.c_str(),
+                                  m_playback_input_rate, m_playback_output_rate, speex_resampler_strerror(err));
             }
         }
     }
@@ -182,8 +183,9 @@ class AudioStreamer {
     void handleDataMessage(const ix::WebSocketMessagePtr& message) {
         if (message->str.size() > MAX_WS_MESSAGE_BYTES) {
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                              "(%s) Dropping oversized %s WebSocket message (%zu bytes, max %d)\n", m_sessionId.c_str(),
-                              message->binary ? "binary" : "text", message->str.size(), MAX_WS_MESSAGE_BYTES);
+                              "(%s) Dropping oversized %s WebSocket message (%zu bytes, max %zu)\n",
+                              m_sessionId.c_str(), message->binary ? "binary" : "text", message->str.size(),
+                              MAX_WS_MESSAGE_BYTES);
             if (message->binary && m_raw_audio_mode) {
                 resetPlaybackDecoderState();
             }
@@ -356,7 +358,7 @@ class AudioStreamer {
         size_t in_samples = size / 2;
 
         if (!m_resampler) {
-            if (in_sample_rate != out_sample_rate) {
+            if (m_playback_input_rate != m_playback_output_rate) {
                 // the playback resampler failed to initialize: dropping the audio is safer
                 // than feeding the channel at the wrong rate
                 return {};
@@ -366,7 +368,7 @@ class AudioStreamer {
             return buffer;
         }
 
-        double scaled = static_cast<double>(in_samples) * out_sample_rate / in_sample_rate;
+        double scaled = static_cast<double>(in_samples) * m_playback_output_rate / m_playback_input_rate;
         size_t out_samples = static_cast<size_t>(scaled) + 1;
 
         if (in_samples > UINT32_MAX || out_samples > UINT32_MAX) {
@@ -400,7 +402,7 @@ class AudioStreamer {
         const uint16_t bitsPerSample = 16;
         const uint16_t audioFormat = 1;
         const uint32_t formatChunkSize = 16;
-        const uint32_t byteRate = in_sample_rate * numChannels * bitsPerSample / 8;
+        const uint32_t byteRate = m_playback_input_rate * numChannels * bitsPerSample / 8;
         const uint16_t blockAlign = numChannels * bitsPerSample / 8;
         const uint32_t dataSize = static_cast<uint32_t>(rawAudio.size());
         const uint32_t chunkSize = 36 + dataSize;
@@ -415,7 +417,7 @@ class AudioStreamer {
         wavStream.write(reinterpret_cast<const char *>(&formatChunkSize), 4);
         wavStream.write(reinterpret_cast<const char *>(&audioFormat), 2);
         wavStream.write(reinterpret_cast<const char *>(&numChannels), 2);
-        wavStream.write(reinterpret_cast<const char *>(&in_sample_rate), 4);
+        wavStream.write(reinterpret_cast<const char *>(&m_playback_input_rate), 4);
         wavStream.write(reinterpret_cast<const char *>(&byteRate), 4);
         wavStream.write(reinterpret_cast<const char *>(&blockAlign), 2);
         wavStream.write(reinterpret_cast<const char *>(&bitsPerSample), 2);
@@ -431,8 +433,8 @@ class AudioStreamer {
     std::string saveDebugAudioFile(const std::string& rawAudio, bool notifyPlaybackEvent = false) {
         // Build the path as a std::string so a long temp dir or session id cannot be truncated
         // into a colliding name by a fixed-size buffer
-        const std::string filePath = std::string(SWITCH_GLOBAL_dirs.temp_dir) + SWITCH_PATH_SEPARATOR + m_sessionId +
-                                     "_" + std::to_string(m_playFile++) + ".tmp.wav";
+        std::string filePath = std::string(SWITCH_GLOBAL_dirs.temp_dir) + SWITCH_PATH_SEPARATOR + m_sessionId + "_" +
+                               std::to_string(m_playFile++) + ".tmp.wav";
 
         // The file holds call audio and lives in a possibly shared temp dir: create it exclusively
         // with owner-only permissions, without following symlinks or overwriting existing files
@@ -598,7 +600,7 @@ class AudioStreamer {
         const auto result = m_playback_queue.push(std::move(audio_data));
         if (result == audio_stream::PlaybackQueue::PushResult::OverflowStarted) {
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                              "(%s) push_audio_queue: playback queue reached its %d-second capacity; dropping "
+                              "(%s) push_audio_queue: playback queue reached its %zu-second capacity; dropping "
                               "incoming audio that does not fit\n",
                               m_sessionId.c_str(), MAX_PLAYBACK_QUEUE_SECONDS);
         }
@@ -764,14 +766,14 @@ class AudioStreamer {
     int m_playFile;
     std::unordered_set<std::string> m_Files;
 
-    int in_sample_rate = 24000;
-    int out_sample_rate = 16000;
+    uint32_t m_playback_input_rate;
+    uint32_t m_playback_output_rate;
     SpeexResamplerState *m_resampler = nullptr;
     audio_stream::PlaybackQueue m_playback_queue;
     std::atomic<uint64_t> m_playback_clear_gen{0};
     uint64_t m_playback_clear_gen_seen = 0; // media (write_frame) thread only
-    bool m_disable_audiofiles = false;      // disable saving audio files if true
-    bool m_openai_speaking = false;         // media (write_frame) thread only
+    bool m_disable_audiofiles = false;
+    bool m_openai_speaking = false; // media (write_frame) thread only
     std::atomic<bool> m_response_audio_done{false};
     std::atomic<bool> m_terminal_close{false};        // connection closed and no reconnection will be attempted
     std::atomic<bool> m_send_failure_logged{false};   // rate-limits the dropped-audio warning to once per episode
@@ -1208,7 +1210,6 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
                                     const stream_start_options_t *options, void **ppUserData) {
     int deflate = 0, heart_beat = 0;
     bool suppressLog = false;
-    const char *buffer_size;
     const char *extra_headers = NULL;
     int rtp_packets = 1;
     bool no_reconnect = false;
@@ -1280,7 +1281,8 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
         }
     }
 
-    if ((buffer_size = switch_channel_get_variable(channel, "STREAM_BUFFER_SIZE"))) {
+    const char *buffer_size = switch_channel_get_variable(channel, "STREAM_BUFFER_SIZE");
+    if (buffer_size) {
         char *endptr;
         long bSize = strtol(buffer_size, &endptr, 10);
         if (*endptr != '\0' || endptr == buffer_size || bSize < 20 || bSize > MAX_STREAM_BUFFER_MS || bSize % 20 != 0) {

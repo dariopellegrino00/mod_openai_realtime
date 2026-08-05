@@ -60,14 +60,12 @@ jobs:
           MODULE_FILES="$(echo "$ALL_FILES" | grep -Ev '^(libs|tests)/' || true)"
           TEST_FILES="$(echo "$ALL_FILES" | grep '^tests/' || true)"
           if [ -n "$MODULE_FILES" ]; then
-            clang-tidy -p build $MODULE_FILES \
-              --warnings-as-errors='clang-analyzer-*,bugprone-*,performance-*'
+            clang-tidy --config-file=.clang-tidy -p build $MODULE_FILES
           else
             echo "No module source files found for clang-tidy analysis."
           fi
           if [ -n "$TEST_FILES" ]; then
-            clang-tidy -p build-tests $TEST_FILES \
-              --warnings-as-errors='clang-analyzer-*,bugprone-*,performance-*'
+            clang-tidy --config-file=.clang-tidy -p build-tests $TEST_FILES
           else
             echo "No test source files found for clang-tidy analysis."
           fi

@@ -22,6 +22,8 @@ static void free_event_subclasses(void) {
     switch_event_free_subclass(EVENT_OPENAI_SPEECH_STOPPED);
 }
 
+/* The responseHandler_t callback signature fixes the order of these string parameters. */
+/* NOLINTNEXTLINE(bugprone-easily-swappable-parameters) */
 static void responseHandler(switch_core_session_t *session, const char *eventName, const char *json) {
     switch_event_t *event;
     switch_channel_t *channel = switch_core_session_get_channel(session);
@@ -272,12 +274,15 @@ static stream_command_t stream_command_from_string(const char *name) {
 static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch_core_session_t *session,
                                           const char *cmd, const stream_api_config_t *api_config) {
     char *mycmd = NULL, *argv[8] = {0};
-    int argc = 0;
+    unsigned int argc = 0;
     void *lifecycle_guard = NULL;
 
     switch_status_t status = SWITCH_STATUS_FALSE;
 
-    if (!zstr(cmd) && (mycmd = strdup(cmd))) {
+    if (!zstr(cmd)) {
+        mycmd = strdup(cmd);
+    }
+    if (mycmd) {
         argc = switch_separate_string(mycmd, ' ', argv, (sizeof(argv) / sizeof(argv[0])));
     }
 
@@ -295,8 +300,8 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
                           api_config->api_name, cmd ? cmd : "");
     }
 
-    switch_core_session_t *lsession = NULL;
-    if ((lsession = switch_core_session_locate(argv[0]))) {
+    switch_core_session_t *lsession = switch_core_session_locate(argv[0]);
+    if (lsession) {
         lifecycle_guard = stream_session_lifecycle_lock(lsession);
         if (!lifecycle_guard) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
@@ -361,7 +366,7 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
                                       "invalid mix type: %s, must be mono, mixed, or stereo\n", argv[3]);
                     goto release_session;
                 }
-                int next_index = 4;
+                unsigned int next_index = 4;
                 if (next_index < argc && strcasecmp(argv[next_index], "mute_user") != 0) {
                     sampling_str = argv[next_index];
                     sampling = parse_sampling_rate(sampling_str);
