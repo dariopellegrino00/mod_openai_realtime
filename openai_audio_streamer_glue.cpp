@@ -1528,7 +1528,17 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
 
 switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bug) {
     private_t *tech_pvt = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
-    if (!tech_pvt || switch_atomic_read(&tech_pvt->audio_paused)) {
+    if (!tech_pvt) {
+        return SWITCH_TRUE;
+    }
+
+    AudioStreamer *as = audio_streamer(tech_pvt);
+    if (switch_atomic_read(&tech_pvt->audio_paused)) {
+        // A paused stream cannot drain queued playback. Once a non-reconnecting peer is gone,
+        // keeping the media bug alive would leave the session permanently unable to restart.
+        if (as && as->is_terminally_closed()) {
+            switch_atomic_set(&tech_pvt->close_requested, 1);
+        }
         return SWITCH_TRUE;
     }
 
@@ -1537,8 +1547,6 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
     if (!frame || !codec || !codec->implementation) {
         return SWITCH_TRUE;
     }
-
-    AudioStreamer *as = audio_streamer(tech_pvt);
 
     // No isConnected() check: queued audio must keep draining after the connection drops
     if (!as) {

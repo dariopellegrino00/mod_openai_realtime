@@ -3,6 +3,7 @@ import base64
 import json
 import math
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -21,6 +22,95 @@ ARTIFACT_DIR = Path(os.environ["TEST_ARTIFACT_DIR"]) if os.environ.get("TEST_ART
 PCM16_BYTES_PER_SAMPLE = 2
 AUDIBLE_SAMPLE_THRESHOLD = 500
 MODULE_LOG_SOURCES = ("mod_openai_audio_stream.c:", "openai_audio_streamer_glue.cpp:")
+SPEECH_START_EVENT = "mod_openai_audio_stream::openai_speech_start"
+SPEECH_STOP_EVENT = "mod_openai_audio_stream::openai_speech_stop"
+
+
+class FreeSwitchEventSocket:
+    """Minimal inbound ESL client used to observe the module's public custom events."""
+
+    def __init__(self, unique_id):
+        self._unique_id = unique_id
+        self.seen_events = []
+        self._socket = socket.create_connection(("127.0.0.1", 8021), timeout=5)
+        self._buffer = bytearray()
+        try:
+            headers, _ = self._receive_packet(5)
+            if headers.get("content-type") != "auth/request":
+                raise RuntimeError(f"unexpected FreeSWITCH event socket greeting: {headers}")
+            self._command("auth ClueCon")
+            self._command(f"event json CUSTOM {SPEECH_START_EVENT} {SPEECH_STOP_EVENT}")
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        self._socket.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        self.close()
+
+    def _header_boundary(self):
+        boundaries = []
+        for marker in (b"\r\n\r\n", b"\n\n"):
+            index = self._buffer.find(marker)
+            if index >= 0:
+                boundaries.append((index, len(marker)))
+        return min(boundaries) if boundaries else None
+
+    def _receive_packet(self, timeout):
+        self._socket.settimeout(timeout)
+        boundary = self._header_boundary()
+        while boundary is None:
+            chunk = self._socket.recv(4096)
+            if not chunk:
+                raise RuntimeError("FreeSWITCH event socket closed unexpectedly")
+            self._buffer.extend(chunk)
+            boundary = self._header_boundary()
+
+        header_end, marker_length = boundary
+        raw_headers = bytes(self._buffer[:header_end]).decode("utf-8", errors="replace")
+        del self._buffer[: header_end + marker_length]
+        headers = {}
+        for line in raw_headers.replace("\r\n", "\n").split("\n"):
+            if ":" in line:
+                name, value = line.split(":", 1)
+                headers[name.strip().lower()] = value.strip()
+
+        content_length = int(headers.get("content-length", "0"))
+        while len(self._buffer) < content_length:
+            chunk = self._socket.recv(4096)
+            if not chunk:
+                raise RuntimeError("FreeSWITCH event socket closed in a packet body")
+            self._buffer.extend(chunk)
+        body = bytes(self._buffer[:content_length])
+        del self._buffer[:content_length]
+        return headers, body
+
+    def _command(self, command):
+        self._socket.sendall(f"{command}\n\n".encode())
+        headers, _ = self._receive_packet(5)
+        if headers.get("content-type") != "command/reply" or not headers.get("reply-text", "").startswith("+OK"):
+            raise RuntimeError(f"FreeSWITCH event socket command failed: {command}: {headers}")
+
+    def wait_for(self, event_subclass, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                headers, body = self._receive_packet(remaining)
+            except socket.timeout:
+                return None
+            if headers.get("content-type") != "text/event-json":
+                continue
+            event = json.loads(body)
+            self.seen_events.append((event.get("Unique-ID"), event.get("Event-Subclass")))
+            if event.get("Unique-ID") == self._unique_id and event.get("Event-Subclass") == event_subclass:
+                return event
+        return None
 
 
 def api(command, timeout=10):
@@ -155,6 +245,31 @@ def active_runs(samples, sample_rate, window_ms=5, threshold=500):
                 runs += 1
         active = window_active
     return runs, active_windows * window_size / sample_rate
+
+
+def longest_silent_gap(samples, sample_rate, window_ms=20, threshold=500):
+    window_size = max(sample_rate * window_ms // 1000, 1)
+    activity = []
+    for offset in range(0, len(samples) - window_size + 1, window_size):
+        window = samples[offset : offset + window_size]
+        mean_square = sum(sample * sample for sample in window) / len(window)
+        activity.append(mean_square >= threshold**2)
+
+    try:
+        first_active = activity.index(True)
+        last_active = len(activity) - 1 - activity[::-1].index(True)
+    except ValueError:
+        return 0.0
+
+    longest = 0
+    current = 0
+    for active in activity[first_active : last_active + 1]:
+        if active:
+            longest = max(longest, current)
+            current = 0
+        else:
+            current += 1
+    return max(longest, current) * window_size / sample_rate
 
 
 def tone_durations(samples, sample_rate, frequencies, window_ms=20, threshold=AUDIBLE_SAMPLE_THRESHOLD):
@@ -317,14 +432,66 @@ class ModuleIntegrationTest(unittest.TestCase):
         frequency = dominant_frequency(samples, sample_rate)
         self.assertAlmostEqual(frequency, expected_frequency, delta=75)
 
-    def test_flow_control_and_final_stop_payload(self):
+    def test_final_stop_payload(self):
         self.start_stream()
-        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} pause")
-        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} resume")
-        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} mute openai")
-        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} unmute openai")
-
         self.stop_stream({"type": "integration.final", "marker": "stop-payload"})
+        self.expect_no_module_errors()
+
+    def assert_playback_control_creates_silence(self, command, inverse_command, scenario):
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            self.start_stream(f"{MOCK_URL}/flow-control")
+            self.start_recording(scenario)
+            before = len(mock_events())
+            assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {encode_json({'type': 'response.create'})}")
+            sent = wait_for_event(lambda event: event.get("event") == "flow-control-response-sent", before)
+            self.assertIsNotNone(sent, "mock playback response was not delivered")
+            started = event_socket.wait_for(SPEECH_START_EVENT)
+            self.assertIsNotNone(
+                started,
+                f"module did not emit the playback-start event; observed {event_socket.seen_events}",
+            )
+
+            assert_ok(self, f"uuid_openai_audio_stream {self.uuid} {command}")
+            time.sleep(0.3)
+            assert_ok(self, f"uuid_openai_audio_stream {self.uuid} {inverse_command}")
+            time.sleep(0.35)
+            sample_rate, samples = self.stop_recording()
+
+        runs, _ = active_runs(samples, sample_rate, window_ms=20)
+        self.assertGreaterEqual(runs, 2, f"{command} did not interrupt audible playback")
+        self.assertGreater(
+            longest_silent_gap(samples, sample_rate),
+            0.15,
+            f"{command} did not create the expected silent playback interval",
+        )
+        self.assertAlmostEqual(dominant_frequency(samples, sample_rate), sent["frequency"], delta=75)
+        self.stop_stream()
+        self.expect_no_module_errors()
+
+    def test_pause_and_resume_control_playback(self):
+        self.assert_playback_control_creates_silence("pause", "resume", "pause-resume")
+
+    def test_openai_mute_controls_playback(self):
+        self.assert_playback_control_creates_silence("mute openai", "unmute openai", "openai-mute")
+
+    def test_playback_emits_speech_lifecycle_events(self):
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            self.start_stream()
+            before = len(mock_events())
+            assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {encode_json({'type': 'response.create'})}")
+            sent = wait_for_event(lambda event: event.get("event") == "audio-response-sent", before)
+            self.assertIsNotNone(sent, "mock playback response was not delivered")
+            started = event_socket.wait_for(SPEECH_START_EVENT)
+            stopped = event_socket.wait_for(SPEECH_STOP_EVENT)
+            self.assertIsNotNone(
+                started,
+                f"module did not emit the playback-start event; observed {event_socket.seen_events}",
+            )
+            self.assertIsNotNone(
+                stopped,
+                f"module did not emit the playback-stop event after AudioDone; observed {event_socket.seen_events}",
+            )
+        self.stop_stream()
         self.expect_no_module_errors()
 
     def test_caller_audio_reaches_websocket(self):
@@ -652,6 +819,20 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(closed, "mock peer did not close the WebSocket")
         disconnected = wait_for_event(lambda event: event.get("event") == "disconnected", before)
         self.assertIsNotNone(disconnected, "mock WebSocket handler did not finish after peer close")
+
+        self.restart_after_automatic_cleanup()
+        self.stop_stream()
+
+    def test_peer_close_while_paused_cleans_up_without_resume(self):
+        before = len(mock_events())
+        self.start_stream(f"{MOCK_URL}/close-on-command")
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} pause")
+        close_message = encode_json({"type": "integration.close"})
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {close_message}")
+        closed = wait_for_event(lambda event: event.get("event") == "closed", before)
+        self.assertIsNotNone(closed, "mock peer did not close the paused WebSocket")
+        disconnected = wait_for_event(lambda event: event.get("event") == "disconnected", before)
+        self.assertIsNotNone(disconnected, "mock WebSocket handler did not finish after paused close")
 
         self.restart_after_automatic_cleanup()
         self.stop_stream()

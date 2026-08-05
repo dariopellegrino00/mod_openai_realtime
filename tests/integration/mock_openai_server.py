@@ -79,6 +79,11 @@ class MockRealtimeServer:
                     continue
 
                 message_type = payload.get("type", "")
+                if path == "/close-on-command" and message_type == "integration.close":
+                    await websocket.close(code=1011, reason="intentional paused-close integration test")
+                    await self.record("closed", path=path, connection_number=connection_number)
+                    return
+
                 if message_type == "input_audio_buffer.append":
                     try:
                         audio = base64.b64decode(payload.get("audio", ""), validate=True)
@@ -110,6 +115,8 @@ class MockRealtimeServer:
                         await self.send_underrun_response(websocket)
                     elif path == "/barge-in":
                         await self.send_barge_in_response(websocket)
+                    elif path == "/flow-control":
+                        await self.send_flow_control_response(websocket)
                     elif path == "/debug-audio":
                         await self.send_debug_audio_response(websocket)
                     elif path == "/raw-audio":
@@ -212,6 +219,24 @@ class MockRealtimeServer:
             burst_duration=burst_duration,
             burst_interval=burst_interval,
             elapsed=time.monotonic() - started_at,
+        )
+
+    async def send_flow_control_response(self, websocket):
+        sample_rate = 24000
+        frequency = 900
+        duration = 2.0
+        response_id = "integration-flow-control-response"
+        await self.send_audio_delta(
+            websocket,
+            response_id,
+            pcm16_tone(sample_rate, frequency, duration),
+        )
+        await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
+        await self.record(
+            "flow-control-response-sent",
+            response_id=response_id,
+            frequency=frequency,
+            duration=duration,
         )
 
     async def send_barge_in_response(self, websocket):
