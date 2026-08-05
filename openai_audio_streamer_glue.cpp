@@ -979,6 +979,23 @@ void finish(private_t *tech_pvt) {
     }
 }
 
+bool capture_is_paused_or_muted(private_t *tech_pvt) {
+    return switch_atomic_read(&tech_pvt->audio_paused) || switch_atomic_read(&tech_pvt->user_audio_muted);
+}
+
+bool reset_capture_resampler(private_t *tech_pvt) {
+    if (!tech_pvt->resampler) {
+        return true;
+    }
+    const int result = speex_resampler_reset_mem(tech_pvt->resampler);
+    if (result == RESAMPLER_ERR_SUCCESS) {
+        return true;
+    }
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "%s: Failed to reset capture resampler: %s\n",
+                      tech_pvt->sessionId, speex_resampler_strerror(result));
+    return false;
+}
+
 // Send any residual aggregated capture audio, then clear the aggregator.
 // The residue is dropped if the WebSocket is not connected. Caller must hold tech_pvt->mutex.
 void flush_capture_residue(private_t *tech_pvt) {
@@ -1126,6 +1143,11 @@ switch_status_t stream_session_pauseresume(switch_core_session_t *session, int p
 
     switch_core_media_bug_flush(context.bug);
     switch_atomic_set(&context.data->audio_paused, pause ? 1 : 0);
+    if (pause && context.data->mutex) {
+        // Wait for a capture callback that observed the old state to leave before acknowledging pause.
+        switch_mutex_lock(context.data->mutex);
+        switch_mutex_unlock(context.data->mutex);
+    }
     return SWITCH_STATUS_SUCCESS;
 }
 
@@ -1158,6 +1180,9 @@ switch_status_t stream_session_set_user_mute(switch_core_session_t *session, int
 
         // Deliver the residual pre-mute speech before injecting silence, instead of dropping it
         flush_capture_residue(tech_pvt);
+        if (!reset_capture_resampler(tech_pvt)) {
+            status = SWITCH_STATUS_FALSE;
+        }
 
         AudioStreamer *streamer = audio_streamer(tech_pvt);
         if (streamer && streamer->isConnected()) {
@@ -1191,7 +1216,6 @@ switch_status_t stream_session_set_openai_mute(switch_core_session_t *session, i
     }
     private_t *tech_pvt = context.data;
 
-    switch_core_media_bug_flush(context.bug);
     const uint32_t new_state = mute ? 1 : 0;
     const uint32_t last_state = switch_atomic_read(&tech_pvt->openai_audio_muted);
     switch_atomic_set(&tech_pvt->openai_audio_muted, new_state);
@@ -1411,10 +1435,18 @@ switch_status_t stream_session_start(void *pUserData) {
 
 switch_bool_t stream_frame(switch_media_bug_t *bug) {
     auto *tech_pvt = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
-    if (!tech_pvt || switch_atomic_read(&tech_pvt->audio_paused) || switch_atomic_read(&tech_pvt->user_audio_muted))
+    if (!tech_pvt || capture_is_paused_or_muted(tech_pvt))
         return SWITCH_TRUE;
 
+    // READ holds the media bug's read_mutex; control commands hold this mutex before flushing the bug.
+    // A blocking lock here would invert that order and deadlock capture against pause or user mute.
     if (switch_mutex_trylock(tech_pvt->mutex) != SWITCH_STATUS_SUCCESS) {
+        return SWITCH_TRUE;
+    }
+
+    // A control command may have changed state after the lock-free fast-path check above.
+    if (capture_is_paused_or_muted(tech_pvt)) {
+        switch_mutex_unlock(tech_pvt->mutex);
         return SWITCH_TRUE;
     }
 
@@ -1434,9 +1466,7 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
     // Persistent buffers are direct runtime members and live for the whole session.
     StreamBuffers& buffers = runtime->buffers();
 
-    auto flush_sbuffer = [tech_pvt]() { flush_capture_residue(tech_pvt); };
-
-    auto send_or_buffer_audio = [tech_pvt, streamer, &flush_sbuffer](const uint8_t *data, size_t length) {
+    auto send_or_buffer_audio = [tech_pvt, streamer](const uint8_t *data, size_t length) {
         if (tech_pvt->rtp_packets == 1) {
             streamer->sendAudio(data, length);
             return true;
@@ -1445,7 +1475,7 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
         while (length > 0) {
             switch_size_t free_space = switch_buffer_freespace(tech_pvt->sbuffer);
             if (free_space == 0) {
-                flush_sbuffer();
+                flush_capture_residue(tech_pvt);
                 free_space = switch_buffer_freespace(tech_pvt->sbuffer);
                 if (free_space == 0) {
                     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
@@ -1464,7 +1494,7 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
             data += write_len;
             length -= write_len;
             if (switch_buffer_freespace(tech_pvt->sbuffer) == 0) {
-                flush_sbuffer();
+                flush_capture_residue(tech_pvt);
             }
         }
 
@@ -1476,7 +1506,6 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
     frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
 
     while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
-        // Validate frame data before processing
         if (frame.datalen == 0 || frame.samples == 0) {
             continue;
         }
@@ -1580,13 +1609,12 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
     uint32_t bytes_needed = frame->datalen;
     uint32_t bytes_per_sample = frame->datalen / frame->samples;
 
-    if (bytes_needed > frame->buflen) { // may be useless
+    if (bytes_needed > frame->buflen) {
         bytes_needed = frame->buflen;
     }
 
     uint32_t inuse = switch_buffer_inuse(tech_pvt->playback_buffer);
 
-    // push a chunk in the audio buffer used treated as cache
     if (as->consume_playback_clear()) {
         switch_buffer_zero(tech_pvt->playback_buffer);
         inuse = 0;
