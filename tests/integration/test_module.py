@@ -22,6 +22,7 @@ ARTIFACT_DIR = Path(os.environ["TEST_ARTIFACT_DIR"]) if os.environ.get("TEST_ART
 PCM16_BYTES_PER_SAMPLE = 2
 AUDIBLE_SAMPLE_THRESHOLD = 500
 MODULE_LOG_SOURCES = ("mod_openai_audio_stream.c:", "openai_audio_streamer_glue.cpp:")
+MEDIA_BUG_NAME = "audio_stream"  # Keep in sync with MY_BUG_NAME in mod_openai_audio_stream.h.
 SPEECH_START_EVENT = "mod_openai_audio_stream::openai_speech_start"
 SPEECH_STOP_EVENT = "mod_openai_audio_stream::openai_speech_stop"
 
@@ -134,7 +135,8 @@ def assert_ok(test, command):
 
 def assert_error(test, command):
     result = api(command)
-    test.assertTrue(result.startswith("-ERR"), f"command unexpectedly succeeded: {command}\n{result}")
+    lines = result.splitlines()
+    test.assertTrue(lines and lines[-1].startswith("-ERR"), f"command unexpectedly succeeded: {command}\n{result}")
     return result
 
 
@@ -291,7 +293,7 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.recording = None
         self.event_start = len(mock_events())
         self.freeswitch_log_start = FREESWITCH_LOG.stat().st_size
-        self.check_module_errors = False
+        self.expected_module_error_fragments = []
         self.addCleanup(self.cleanup_resources)
         self.originate_call()
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_OPENAI_API_KEY integration-test-key")
@@ -312,8 +314,7 @@ class ModuleIntegrationTest(unittest.TestCase):
             if event.get("event") in {"audio-received", "binary"} and event.get("sample_aligned") is not True
         ]
         self.assertEqual(misaligned_audio, [], "module sent a partial PCM16 sample")
-        if self.check_module_errors:
-            self.assert_no_module_errors()
+        self.assert_expected_module_errors()
 
     def cleanup_resources(self):
         try:
@@ -346,23 +347,29 @@ class ModuleIntegrationTest(unittest.TestCase):
             if "[ERR]" in line and any(source in line for source in MODULE_LOG_SOURCES)
         ]
 
-    def assert_no_module_errors(self):
-        errors = self.module_error_lines()
-        self.assertEqual(errors, [], "module logged errors on a successful path:\n" + "\n".join(errors))
+    def assert_expected_module_errors(self):
+        unmatched = self.module_error_lines()
+        for fragment in self.expected_module_error_fragments:
+            match = next((index for index, line in enumerate(unmatched) if fragment in line), None)
+            if match is None:
+                self.fail(f"module did not log expected error {fragment!r}; observed {unmatched}")
+            unmatched.pop(match)
+        self.assertEqual(unmatched, [], "module logged unexpected errors:\n" + "\n".join(unmatched))
 
-    def expect_no_module_errors(self):
-        self.check_module_errors = True
+    def expect_module_errors(self, *fragments):
+        self.expected_module_error_fragments.extend(fragments)
 
     def start_stream(
         self,
         url=MOCK_URL,
         start_muted=True,
         stream_api="uuid_openai_audio_stream",
+        send_rate="24k",
         playback_rate=None,
         mix_type="mono",
     ):
         before = len(mock_events())
-        command = f"{stream_api} {self.uuid} start {url} {mix_type} 24k"
+        command = f"{stream_api} {self.uuid} start {url} {mix_type} {send_rate}"
         if playback_rate is not None:
             command += f" {playback_rate}"
         if start_muted:
@@ -403,17 +410,29 @@ class ModuleIntegrationTest(unittest.TestCase):
 
     def restart_after_automatic_cleanup(self, timeout=5):
         deadline = time.monotonic() + timeout
-        last_result = "no start attempt completed"
+        last_bug_list = "no media-bug query completed"
         while time.monotonic() < deadline:
-            before = len(mock_events())
-            command = f"uuid_openai_audio_stream {self.uuid} start {MOCK_URL} mono 24k mute_user"
-            last_result = api(command)
-            if last_result.startswith("+OK"):
-                connected = wait_for_event(lambda event: event.get("event") == "connected", before)
-                self.assertIsNotNone(connected, "restart succeeded but WebSocket did not reconnect")
+            last_bug_list = api(f"uuid_buglist {self.uuid}")
+            self.assertFalse(last_bug_list.startswith("-ERR"), f"media-bug query failed: {last_bug_list}")
+            if MEDIA_BUG_NAME not in last_bug_list:
+                self.start_stream()
                 return
             time.sleep(0.05)
-        self.fail(f"stream context was not cleaned up after peer disconnect: {last_result}")
+        self.fail(f"stream context was not cleaned up after peer disconnect: {last_bug_list}")
+
+    def trigger_response(
+        self,
+        expected_event,
+        payload=None,
+        stream_api="uuid_openai_audio_stream",
+        timeout=5,
+    ):
+        before = len(mock_events())
+        request = encode_json(payload if payload is not None else {"type": "response.create"})
+        assert_ok(self, f"{stream_api} {self.uuid} send_json {request}")
+        event = wait_for_event(lambda item: item.get("event") == expected_event, before, timeout=timeout)
+        self.assertIsNotNone(event, f"mock did not emit {expected_event}")
+        return event
 
     def assert_recording_contains_tone(self, expected_frequency, expected_duration_seconds):
         self.assertTrue(
@@ -438,16 +457,12 @@ class ModuleIntegrationTest(unittest.TestCase):
     def test_final_stop_payload(self):
         self.start_stream()
         self.stop_stream({"type": "integration.final", "marker": "stop-payload"})
-        self.expect_no_module_errors()
 
     def assert_playback_control_creates_silence(self, command, inverse_command, scenario):
         with FreeSwitchEventSocket(self.uuid) as event_socket:
             self.start_stream(f"{MOCK_URL}/flow-control")
             self.start_recording(scenario)
-            before = len(mock_events())
-            assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {encode_json({'type': 'response.create'})}")
-            sent = wait_for_event(lambda event: event.get("event") == "flow-control-response-sent", before)
-            self.assertIsNotNone(sent, "mock playback response was not delivered")
+            sent = self.trigger_response("flow-control-response-sent")
             started = event_socket.wait_for(SPEECH_START_EVENT)
             self.assertIsNotNone(
                 started,
@@ -469,7 +484,6 @@ class ModuleIntegrationTest(unittest.TestCase):
         )
         self.assertAlmostEqual(dominant_frequency(samples, sample_rate), sent["frequency"], delta=75)
         self.stop_stream()
-        self.expect_no_module_errors()
 
     def test_pause_and_resume_control_playback(self):
         self.assert_playback_control_creates_silence("pause", "resume", "pause-resume")
@@ -480,10 +494,7 @@ class ModuleIntegrationTest(unittest.TestCase):
     def test_playback_emits_speech_lifecycle_events(self):
         with FreeSwitchEventSocket(self.uuid) as event_socket:
             self.start_stream()
-            before = len(mock_events())
-            assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {encode_json({'type': 'response.create'})}")
-            sent = wait_for_event(lambda event: event.get("event") == "audio-response-sent", before)
-            self.assertIsNotNone(sent, "mock playback response was not delivered")
+            self.trigger_response("audio-response-sent")
             started = event_socket.wait_for(SPEECH_START_EVENT)
             stopped = event_socket.wait_for(SPEECH_STOP_EVENT)
             self.assertIsNotNone(
@@ -495,19 +506,12 @@ class ModuleIntegrationTest(unittest.TestCase):
                 f"module did not emit the playback-stop event after AudioDone; observed {event_socket.seen_events}",
             )
         self.stop_stream()
-        self.expect_no_module_errors()
 
     def test_invalid_audio_delta_does_not_reopen_completed_playback(self):
+        self.expect_module_errors("response.output_audio.delta no audio data")
         with FreeSwitchEventSocket(self.uuid) as event_socket:
             self.start_stream(f"{MOCK_URL}/invalid-delta-after-done")
-            before = len(mock_events())
-            request = encode_json({"type": "response.create"})
-            assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
-            sent = wait_for_event(
-                lambda event: event.get("event") == "invalid-delta-after-done-sent",
-                before,
-            )
-            self.assertIsNotNone(sent, "mock invalid audio delta sequence was not delivered")
+            sent = self.trigger_response("invalid-delta-after-done-sent")
 
             started = event_socket.wait_for(SPEECH_START_EVENT)
             stopped = event_socket.wait_for(SPEECH_STOP_EVENT, timeout=sent["duration_seconds"] + 3)
@@ -521,9 +525,6 @@ class ModuleIntegrationTest(unittest.TestCase):
             )
 
         self.stop_stream()
-        errors = self.module_error_lines()
-        self.assertEqual(len(errors), 1, f"unexpected module errors: {errors}")
-        self.assertIn("response.output_audio.delta no audio data", errors[0])
 
     def test_caller_audio_reaches_websocket(self):
         before = len(mock_events())
@@ -533,7 +534,6 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertGreater(audio["size"], 0, "module sent an empty audio payload")
         self.assertTrue(audio["sample_aligned"], "module sent a partial PCM16 sample")
         self.stop_stream()
-        self.expect_no_module_errors()
 
     def test_capture_buffering_and_user_mute(self):
         capture_rate = 24000
@@ -585,7 +585,6 @@ class ModuleIntegrationTest(unittest.TestCase):
             "audible caller audio did not resume after unmute",
         )
         self.stop_stream()
-        self.expect_no_module_errors()
 
     def test_stereo_capture_preserves_channel_separation(self):
         self.start_read_tone()
@@ -608,6 +607,19 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertLess(callee_peak, AUDIBLE_SAMPLE_THRESHOLD, "caller tone leaked into the callee channel")
         self.stop_stream()
 
+    def test_invalid_capture_buffer_size_uses_default(self):
+        default_frame_bytes = 24000 * 20 // 1000 * PCM16_BYTES_PER_SAMPLE
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_BUFFER_SIZE 21")
+
+        before = len(mock_events())
+        self.start_stream(start_muted=False)
+        audio = wait_for_event(
+            lambda event: event.get("event") == "audio-received" and event.get("size") == default_frame_bytes,
+            before,
+        )
+        self.assertIsNotNone(audio, "invalid capture buffer size did not fall back to 20 ms")
+        self.stop_stream()
+
     def test_extra_headers_merge_with_authorization(self):
         extra_headers = json.dumps(
             {
@@ -622,55 +634,37 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertEqual(connected["authorization_headers"], ["Bearer integration-test-key"])
         self.assertEqual(connected["integration_headers"], ["preserved"])
         self.stop_stream()
-        self.expect_no_module_errors()
 
     def test_playback_audio_reaches_channel(self):
         self.start_stream()
         self.start_recording("playback")
 
-        before = len(mock_events())
-        request = encode_json({"type": "response.create"})
-        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
-        sent = wait_for_event(lambda event: event.get("event") == "audio-response-sent", before)
-        self.assertIsNotNone(sent, "mock playback tone was not delivered")
+        sent = self.trigger_response("audio-response-sent")
         wait_for_realtime_playback(sent["duration_seconds"])
         self.stop_recording()
 
         self.assert_recording_contains_tone(sent["frequency"], sent["duration_seconds"])
         self.stop_stream()
-        self.expect_no_module_errors()
 
     def test_reused_response_id_does_not_suppress_new_playback(self):
         self.start_stream()
         self.start_recording("response-id")
 
-        before = len(mock_events())
-        request = encode_json({"type": "integration.reused_response_id"})
-        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
-        sent = wait_for_event(
-            lambda event: event.get("event") == "reused-response-id-audio-sent",
-            before,
-        )
-        self.assertIsNotNone(
-            sent,
-            "mock did not send audio with the reused response_id",
+        sent = self.trigger_response(
+            "reused-response-id-audio-sent",
+            {"type": "integration.reused_response_id"},
         )
         wait_for_realtime_playback(sent["duration_seconds"])
         self.stop_recording()
 
         self.assert_recording_contains_tone(sent["frequency"], sent["duration_seconds"])
         self.stop_stream()
-        self.expect_no_module_errors()
 
     def test_playback_recovers_from_repeated_underruns(self):
         self.start_stream(f"{MOCK_URL}/underrun")
         self.start_recording("underrun")
 
-        before = len(mock_events())
-        request = encode_json({"type": "response.create"})
-        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
-        sent = wait_for_event(lambda event: event.get("event") == "underrun-response-sent", before, timeout=10)
-        self.assertIsNotNone(sent, "mock underrun sequence was not delivered")
+        sent = self.trigger_response("underrun-response-sent", timeout=10)
         time.sleep(0.2)
         sample_rate, samples = self.stop_recording()
         recording_duration = len(samples) / sample_rate
@@ -689,17 +683,12 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertLess(active_time, expected_active_time * 1.5, "playback repeated or stretched underrun audio")
         self.assertAlmostEqual(dominant_frequency(samples, sample_rate), sent["frequency"], delta=75)
         self.stop_stream()
-        self.expect_no_module_errors()
 
     def test_barge_in_discards_buffered_audio(self):
         self.start_stream(f"{MOCK_URL}/barge-in")
         self.start_recording("barge-in")
 
-        before = len(mock_events())
-        request = encode_json({"type": "response.create"})
-        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
-        sent = wait_for_event(lambda event: event.get("event") == "barge-in-response-sent", before)
-        self.assertIsNotNone(sent, "mock barge-in sequence was not delivered")
+        sent = self.trigger_response("barge-in-response-sent")
         time.sleep(0.9)
         sample_rate, samples = self.stop_recording()
         durations = tone_durations(
@@ -718,7 +707,6 @@ class ModuleIntegrationTest(unittest.TestCase):
             "replacement audio following barge-in did not reach the channel",
         )
         self.stop_stream()
-        self.expect_no_module_errors()
 
     def test_debug_audio_file_is_private_and_removed_on_stop(self):
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_DISABLE_AUDIOFILES false")
@@ -727,11 +715,7 @@ class ModuleIntegrationTest(unittest.TestCase):
         temp_dir = Path(api("global_getvar temp_dir"))
         debug_file = temp_dir / f"{self.uuid}_0.tmp.wav"
         debug_file.unlink(missing_ok=True)
-        before = len(mock_events())
-        request = encode_json({"type": "response.create"})
-        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
-        sent = wait_for_event(lambda event: event.get("event") == "debug-audio-response-sent", before)
-        self.assertIsNotNone(sent, "mock debug-audio response was not delivered")
+        sent = self.trigger_response("debug-audio-response-sent")
 
         def debug_wav_is_complete():
             try:
@@ -751,7 +735,6 @@ class ModuleIntegrationTest(unittest.TestCase):
 
         self.stop_stream()
         self.assertTrue(wait_until(lambda: not debug_file.exists()), "debug WAV survived stream teardown")
-        self.expect_no_module_errors()
 
     def test_raw_audio_streams_binary_pcm_in_both_directions(self):
         stream_api = "uuid_raw_audio_stream"
@@ -770,11 +753,7 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertTrue(caller_audio["sample_aligned"], "raw caller audio ended with a partial PCM16 sample")
 
         self.start_recording("raw-audio")
-        before = len(mock_events())
-        request = encode_json({"type": "response.create"})
-        assert_ok(self, f"{stream_api} {self.uuid} send_json {request}")
-        sent = wait_for_event(lambda event: event.get("event") == "raw-audio-response-sent", before)
-        self.assertIsNotNone(sent, "mock binary playback stream was not delivered")
+        sent = self.trigger_response("raw-audio-response-sent", stream_api=stream_api)
         self.assertGreater(sent["split_frame_count"], 1, "mock did not split the binary PCM stream")
         time.sleep(1)
 
@@ -795,7 +774,6 @@ class ModuleIntegrationTest(unittest.TestCase):
             "regular binary playback was truncated",
         )
         self.stop_stream(stream_api=stream_api)
-        self.expect_no_module_errors()
 
     def test_raw_audio_resets_decoder_state_after_interruption(self):
         stream_api = "uuid_raw_audio_stream"
@@ -805,14 +783,7 @@ class ModuleIntegrationTest(unittest.TestCase):
             playback_rate="24k",
         )
         self.start_recording("raw-audio-boundary")
-        before = len(mock_events())
-        request = encode_json({"type": "response.create"})
-        assert_ok(self, f"{stream_api} {self.uuid} send_json {request}")
-        sent = wait_for_event(
-            lambda event: event.get("event") == "raw-audio-boundary-response-sent",
-            before,
-        )
-        self.assertIsNotNone(sent, "mock raw-audio boundary response was not delivered")
+        sent = self.trigger_response("raw-audio-boundary-response-sent", stream_api=stream_api)
         time.sleep(0.65)
         sample_rate, samples = self.stop_recording()
         self.assertGreater(audible_duration(samples, sample_rate), 0.35)
@@ -823,9 +794,9 @@ class ModuleIntegrationTest(unittest.TestCase):
             msg="PCM carry or resampler state leaked across the interrupted stream",
         )
         self.stop_stream(stream_api=stream_api)
-        self.expect_no_module_errors()
 
     def test_raw_audio_resets_decoder_state_after_oversized_frame(self):
+        self.expect_module_errors("Dropping oversized binary WebSocket message")
         stream_api = "uuid_raw_audio_stream"
         with FreeSwitchEventSocket(self.uuid) as event_socket:
             self.start_stream(
@@ -834,14 +805,10 @@ class ModuleIntegrationTest(unittest.TestCase):
                 playback_rate="24k",
             )
             self.start_recording("raw-audio-oversized-boundary")
-            before = len(mock_events())
-            request = encode_json({"type": "response.create"})
-            assert_ok(self, f"{stream_api} {self.uuid} send_json {request}")
-            sent = wait_for_event(
-                lambda event: event.get("event") == "raw-audio-oversized-boundary-response-sent",
-                before,
+            sent = self.trigger_response(
+                "raw-audio-oversized-boundary-response-sent",
+                stream_api=stream_api,
             )
-            self.assertIsNotNone(sent, "mock oversized raw-audio response was not delivered")
             stopped = event_socket.wait_for(SPEECH_STOP_EVENT)
             self.assertIsNotNone(
                 stopped,
@@ -859,6 +826,7 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.stop_stream(stream_api=stream_api)
 
     def test_double_start_is_rejected(self):
+        self.expect_module_errors("bug already attached")
         self.start_stream()
         assert_error(self, f"uuid_openai_audio_stream {self.uuid} start {MOCK_URL} mono 24k mute_user")
         self.stop_stream()
@@ -867,7 +835,6 @@ class ModuleIntegrationTest(unittest.TestCase):
         for _ in range(10):
             self.start_stream()
             self.stop_stream()
-        self.expect_no_module_errors()
 
     def test_hangup_while_streaming(self):
         self.start_stream()
@@ -876,7 +843,6 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.uuid = None
         disconnected = wait_for_event(lambda event: event.get("event") == "disconnected", before)
         self.assertIsNotNone(disconnected, "WebSocket did not disconnect after channel hangup")
-        self.expect_no_module_errors()
 
     def test_reconnects_after_transient_peer_failure(self):
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT false")
@@ -893,13 +859,8 @@ class ModuleIntegrationTest(unittest.TestCase):
         )
         self.assertIsNotNone(reconnected, "module did not reconnect after a transient peer failure")
 
-        before = len(mock_events())
-        request = encode_json({"type": "response.create"})
-        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
-        response = wait_for_event(lambda event: event.get("event") == "audio-response-sent", before)
-        self.assertIsNotNone(response, "reconnected WebSocket did not receive messages")
+        self.trigger_response("audio-response-sent")
         self.stop_stream()
-        self.expect_no_module_errors()
 
     def test_reconnect_preserves_completed_playback_lifecycle(self):
         with FreeSwitchEventSocket(self.uuid) as event_socket:
@@ -908,13 +869,7 @@ class ModuleIntegrationTest(unittest.TestCase):
             first_connection = self.start_stream(f"{MOCK_URL}/reconnect-during-playback")
             self.assertEqual(first_connection["connection_number"], 1)
 
-            request = encode_json({"type": "response.create"})
-            assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {request}")
-            sent = wait_for_event(
-                lambda event: event.get("event") == "reconnect-playback-response-sent",
-                before,
-            )
-            self.assertIsNotNone(sent, "mock reconnect playback response was not delivered")
+            sent = self.trigger_response("reconnect-playback-response-sent")
 
             started = event_socket.wait_for(SPEECH_START_EVENT)
             self.assertIsNotNone(
@@ -937,7 +892,6 @@ class ModuleIntegrationTest(unittest.TestCase):
             )
 
         self.stop_stream()
-        self.expect_no_module_errors()
 
     def test_immediate_peer_close_without_reconnect(self):
         before = len(mock_events())
@@ -967,11 +921,78 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.restart_after_automatic_cleanup()
         self.stop_stream()
 
+    def test_send_json_rejects_invalid_payloads(self):
+        self.expect_module_errors("base64 decode error", "invalid JSON")
+        self.start_stream()
+
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json %%%=")
+        invalid_json = base64.b64encode(b'{"type":').decode("ascii")
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {invalid_json}")
+
+        self.stop_stream()
+
+    def test_all_mute_controls_both_audio_directions(self):
+        capture_rate = 24000
+        mute_silence_size = capture_rate * PCM16_BYTES_PER_SAMPLE
+        tone_source = self.start_read_tone()
+
+        before = len(mock_events())
+        self.start_stream(start_muted=False)
+        captured = wait_for_event(
+            lambda event: event.get("event") == "audio-received"
+            and event.get("peak_amplitude", 0) >= AUDIBLE_SAMPLE_THRESHOLD,
+            before,
+        )
+        self.assertIsNotNone(captured, "caller audio did not reach the backend before mute all")
+
+        before = len(mock_events())
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} mute all")
+        silence = wait_for_event(
+            lambda event: event.get("event") == "audio-received"
+            and event.get("size") == mute_silence_size
+            and event.get("all_zero"),
+            before,
+        )
+        self.assertIsNotNone(silence, "mute all did not mute caller audio")
+
+        before = len(mock_events())
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} unmute all")
+        resumed = wait_for_event(
+            lambda event: event.get("event") == "audio-received"
+            and event.get("peak_amplitude", 0) >= AUDIBLE_SAMPLE_THRESHOLD,
+            before,
+        )
+        self.assertIsNotNone(resumed, "unmute all did not resume caller audio")
+        self.stop_stream()
+        assert_ok(self, f"uuid_displace {self.uuid} stop {tone_source}")
+
+        assert_ok(self, f"uuid_break {self.uuid} all")
+        assert_ok(self, f"uuid_broadcast {self.uuid} silence_stream://-1 aleg")
+        self.assert_playback_control_creates_silence("mute all", "unmute all", "mute-all")
+
+    def test_invalid_mute_target_is_rejected(self):
+        self.expect_module_errors("invalid mute target")
+        self.start_stream()
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} mute invalid")
+        self.stop_stream()
+
     def test_invalid_start_arguments_are_rejected(self):
+        self.expect_module_errors(
+            "invalid websocket uri",
+            "invalid mix type",
+            "invalid send sample rate",
+            "invalid playback sample rate",
+            "unexpected argument",
+        )
         assert_error(self, f"uuid_openai_audio_stream {self.uuid} start http://example.test mono 24k")
         assert_error(self, f"uuid_openai_audio_stream {self.uuid} start {MOCK_URL} invalid 24k")
         assert_error(self, f"uuid_openai_audio_stream {self.uuid} start {MOCK_URL} mono 12000")
-        assert_error(self, f"uuid_openai_audio_stream {self.uuid} start {MOCK_URL} mono 24k unexpected")
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} start {MOCK_URL} mono 24k 12000")
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} start {MOCK_URL} mono 24k 24k unexpected")
+
+    def test_decimal_sample_rate_upper_bound_is_accepted(self):
+        self.start_stream(send_rate="48000", playback_rate="48000")
+        self.stop_stream()
 
 
 if __name__ == "__main__":
