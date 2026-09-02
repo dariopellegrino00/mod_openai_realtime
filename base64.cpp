@@ -31,8 +31,8 @@
 
 */
 
-// Local modifications for mod_openai_realtime: formatted to the project style and adjusted
-// implementation types to satisfy the project's compiler and static-analysis checks.
+// Local modifications for mod_openai_realtime: formatted to the project style, adjusted
+// implementation types for project checks, and added structural input validation.
 
 #include "base64.h"
 
@@ -66,15 +66,35 @@ static unsigned int pos_of_char(const unsigned char chr) {
     else if (chr >= '0' && chr <= '9')
         return chr - '0' + ('Z' - 'A') + ('z' - 'a') + 2;
     else if (chr == '+' || chr == '-')
-        return 62; // Be liberal with input and accept both url ('-') and non-url ('+') base 64 characters (
+        return 62; // Accept standard and URL-safe alphabets.
     else if (chr == '/' || chr == '_')
-        return 63; // Ditto for '/' and '_'
+        return 63;
     else
         //
         // 2020-10-23: Throw std::exception rather than const char*
         //(Pablo Martin-Gomez, https://github.com/Bouska)
         //
         throw std::runtime_error("Input is not valid base64-encoded data.");
+}
+
+template <typename String> static void validate_encoded_input(String const& encoded_string) {
+    const size_t length = encoded_string.length();
+    size_t padding = 0;
+    if (length > 0 && (encoded_string.at(length - 1) == '=' || encoded_string.at(length - 1) == '.')) {
+        const auto padding_char = encoded_string.at(length - 1);
+        while (padding < length && encoded_string.at(length - padding - 1) == padding_char) {
+            ++padding;
+        }
+    }
+
+    if (length % 4 == 1 || padding > 2 || (padding > 0 && length % 4 != 0)) {
+        throw std::runtime_error("Input is not valid base64-encoded data.");
+    }
+
+    const size_t data_length = length - padding;
+    for (size_t pos = 0; pos < data_length; ++pos) {
+        static_cast<void>(pos_of_char(encoded_string.at(pos)));
+    }
 }
 
 static std::string insert_linebreaks(std::string str, size_t distance) {
@@ -244,6 +264,11 @@ template <typename String> static std::string decode(String const& encoded_strin
 
 std::string base64_decode(std::string const& s, bool remove_linebreaks) {
     return decode(s, remove_linebreaks);
+}
+
+std::string base64_decode_strict(std::string const& s) {
+    validate_encoded_input(s);
+    return decode(s, false);
 }
 
 std::string base64_encode(std::string const& s, bool url) {

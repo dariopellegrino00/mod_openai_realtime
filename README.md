@@ -252,13 +252,16 @@ All lifecycle commands (`stop`, `pause`, `resume`, `mute`, `unmute`, and `send_j
 ```text
 uuid_openai_audio_stream <uuid> send_json <base64json>
 ```
-Sends a Base64-encoded JSON object to the WebSocket endpoint. Base64 protects spaces, newlines, and other characters from FreeSWITCH API command parsing.
+Sends one complete, NUL-free UTF-8 JSON value to the WebSocket endpoint. The command requires structurally valid
+Base64, which protects spaces, newlines, and other characters from FreeSWITCH API parsing. After validation, the
+decoded bytes are forwarded unchanged rather than reserialized.
 
 ```text
 uuid_openai_audio_stream <uuid> stop [<base64json>]
 ```
-Stops the stream. When the optional base64-encoded JSON payload is present, the module validates and sends it before
-closing the WebSocket connection.
+Stops the stream. The optional payload follows the same validation rules as `send_json` and is sent before the
+WebSocket closes. An invalid final payload is not sent and makes the command return `-ERR`, but teardown still
+completes.
 
 ```text
 uuid_openai_audio_stream <uuid> pause
@@ -376,6 +379,8 @@ the event body but are omitted from the module log because an error reason can c
 
 OpenAI typically returns JSON objects containing Base64-encoded audio to be played to the user. When raw audio mode is enabled with a compatible custom backend, playback audio can also arrive as binary PCM frames.
 Audio delta events may include additional fields; playback requires only `type` and `delta`.
+The `delta` must be structurally valid standard or URL-safe Base64; padding is optional. Malformed audio is rejected
+instead of being decoded partially.
 In raw audio mode, binary PCM frames only carry audio data. Control and lifecycle expectations are described in the [Raw Audio Mode](#raw-audio-mode) section.
 ```json
 {

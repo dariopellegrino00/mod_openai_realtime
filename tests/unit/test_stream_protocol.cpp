@@ -35,6 +35,47 @@ void test_json_depth_limit() {
     CHECK(stream_protocol::json_depth_exceeded("{}", -1));
 }
 
+void test_json_tokens() {
+    const char *valid[] = {
+        "{}",
+        "[true,false,null]",
+        " \t\r\n{\"n\":0} \t\r\n",
+        "0",
+        "-0",
+        "123",
+        "-123",
+        "0.1",
+        "-0.1",
+        "1e0",
+        "1E+2",
+        "1e-2",
+        "-12.34e+56",
+        "9007199254740993",
+        "1e9999",
+        R"({"text":"\"\\\/\b\f\n\r\t\u0000\uD834\uDD1E"})",
+        u8R"({"text":"こんにちは"})",
+    };
+    for (const char *json : valid) {
+        CHECK(stream_protocol::json_tokens_are_valid(json));
+    }
+    const char *invalid[] = {
+        "01",        "-01",         "00",   "+1",   ".1",
+        "-.1",       "1.",          "1.e2", "1e",   "1e+",
+        "1e-",       "--1",         "-",    "NaN",  "Infinity",
+        "[01]",      "{\"n\":-.1}", "\f{}", "{}\v", "{\"text\":\"a\nb\"}",
+        R"("\x20")", R"("\u12xz")", "\"",   "\"\\", "\"\\u",
+        "\"\\u123",  "\"\\u1234",
+    };
+    for (const char *json : invalid) {
+        CHECK(!stream_protocol::json_tokens_are_valid(json));
+    }
+    for (char control = 1; control < 0x20; ++control) {
+        const std::string json = std::string("\"a") + control + "b\"";
+        CHECK(!stream_protocol::json_tokens_are_valid(json.c_str()));
+    }
+    CHECK(!stream_protocol::json_tokens_are_valid(nullptr));
+}
+
 void expect_valid_uri(const char *uri) {
     char destination[256] = {};
     CHECK(stream_protocol::validate_ws_uri(uri, destination, sizeof(destination)));
@@ -119,6 +160,7 @@ int main() {
     int failures = 0;
     failures += run_test("message classification", test_message_classification);
     failures += run_test("JSON depth limit", test_json_depth_limit);
+    failures += run_test("JSON token syntax", test_json_tokens);
     failures += run_test("valid WebSocket URIs", test_valid_websocket_uris);
     failures += run_test("invalid WebSocket URIs", test_invalid_websocket_uris);
     failures += run_test("WebSocket URI destination boundary", test_uri_destination_size_boundary);

@@ -334,11 +334,6 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
                                       "stop accepts at most one final json argument\n");
                     goto release_session;
                 }
-                if (argc > 2 && (is_valid_utf8(argv[2]) != SWITCH_STATUS_SUCCESS)) {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
-                                      "final JSON contains invalid UTF-8 characters\n");
-                    goto release_session;
-                }
                 status = do_stop(lsession, argc > 2 ? argv[2] : NULL);
                 break;
             case STREAM_CMD_PAUSE:

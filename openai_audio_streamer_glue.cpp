@@ -195,6 +195,11 @@ class AudioStreamer {
         }
 
         if (!message->binary) {
+            if (message->str.find('\0') != std::string::npos) {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                                  "(%s) Dropping text WebSocket message containing a NUL byte\n", m_sessionId.c_str());
+                return;
+            }
             eventCallback(MESSAGE, message->str.c_str());
             return;
         }
@@ -517,6 +522,7 @@ class AudioStreamer {
     switch_bool_t handleAudioDelta(switch_core_session_t *session, cJSON *json, std::string& message) {
         const char *json_audio = cJSON_GetObjectCstr(json, "delta");
         if (!json_audio || *json_audio == '\0') {
+            resetPlaybackDecoderState();
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                               "(%s) processMessage - response.output_audio.delta no audio data\n", m_sessionId.c_str());
             return SWITCH_FALSE;
@@ -524,8 +530,9 @@ class AudioStreamer {
 
         std::string raw_audio;
         try {
-            raw_audio = base64_decode(json_audio);
+            raw_audio = base64_decode_strict(json_audio);
         } catch (const std::exception& e) {
+            resetPlaybackDecoderState();
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                               "(%s) processMessage - base64 decode error: %s\n", m_sessionId.c_str(), e.what());
             return SWITCH_FALSE;
@@ -574,7 +581,7 @@ class AudioStreamer {
             return SWITCH_TRUE; // handled: do not forward the untrusted payload
         }
 
-        cJSON *json = cJSON_Parse(message.c_str());
+        cJSON *json = cJSON_ParseWithOpts(message.c_str(), nullptr, 1);
         if (!json) {
             return SWITCH_FALSE;
         }
@@ -1107,19 +1114,12 @@ int validate_ws_uri(const char *url, char *wsUri) {
     return stream_protocol::validate_ws_uri(url, wsUri, MAX_WS_URI) ? 1 : 0;
 }
 
-switch_status_t is_valid_utf8(const char *str) {
-    return stream_protocol::is_valid_utf8(str) ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
-}
-
 switch_status_t stream_session_send_json(switch_core_session_t *session, const char *base64_input) {
     SessionContext context{};
     if (!find_session_context(session, "stream_session_send_json", context)) {
         return SWITCH_STATUS_FALSE;
     }
 
-    cJSON *json_obj = nullptr;
-    char *json_unformatted = nullptr;
-    switch_status_t status = SWITCH_STATUS_FALSE;
     AudioStreamer *streamer = audio_streamer(context.data);
     if (!streamer) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
@@ -1134,7 +1134,7 @@ switch_status_t stream_session_send_json(switch_core_session_t *session, const c
     }
     std::string decoded_str;
     try {
-        decoded_str = base64_decode(base64_input, false);
+        decoded_str = base64_decode_strict(base64_input);
     } catch (const std::exception& e) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "stream_session_send_json failed: base64 decode error: %s\n", e.what());
@@ -1145,40 +1145,41 @@ switch_status_t stream_session_send_json(switch_core_session_t *session, const c
                           "stream_session_send_json base64 decode failed.\n");
         return SWITCH_STATUS_FALSE;
     }
+    if (decoded_str.find('\0') != std::string::npos) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                          "stream_session_send_json failed: decoded JSON contains a NUL byte.\n");
+        return SWITCH_STATUS_FALSE;
+    }
+    if (!stream_protocol::is_valid_utf8(decoded_str.c_str())) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                          "stream_session_send_json failed: decoded JSON contains invalid UTF-8.\n");
+        return SWITCH_STATUS_FALSE;
+    }
 
-    json_obj = cJSON_Parse(decoded_str.c_str());
+    const char *parse_end = decoded_str.c_str();
+    cJSON *json_obj = stream_protocol::json_tokens_are_valid(decoded_str.c_str())
+                          ? cJSON_ParseWithOpts(decoded_str.c_str(), &parse_end, 1)
+                          : nullptr;
     if (!json_obj) {
         if (streamer->suppress_log()) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                               "stream_session_send_json failed: invalid JSON (details suppressed).\n");
         } else {
-            const char *err = cJSON_GetErrorPtr();
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                              "stream_session_send_json failed: invalid JSON. Error near: %s\n", err ? err : "unknown");
+                              "stream_session_send_json failed: invalid JSON. Error near: %s\n",
+                              parse_end ? parse_end : "unknown");
         }
         return SWITCH_STATUS_FALSE;
     }
 
-    json_unformatted = cJSON_PrintUnformatted(json_obj);
-    if (!json_unformatted) {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                          "stream_session_send_json failed: cJSON_PrintUnformatted returned null\n");
-        cJSON_Delete(json_obj);
-        return SWITCH_STATUS_FALSE;
-    }
+    cJSON_Delete(json_obj);
 
     // The payload can carry sensitive data (instructions, base64 audio): honor STREAM_SUPPRESS_LOG
     if (!streamer->suppress_log()) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-                          "stream_session_send_json: sending JSON: %s\n", json_unformatted);
+                          "stream_session_send_json: sending JSON: %s\n", decoded_str.c_str());
     }
-    status = streamer->writeText(json_unformatted) ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
-
-    if (json_unformatted)
-        free(json_unformatted);
-    if (json_obj)
-        cJSON_Delete(json_obj);
-    return status;
+    return streamer->writeText(decoded_str.c_str()) ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
 }
 
 switch_status_t stream_session_pauseresume(switch_core_session_t *session, int pause) {

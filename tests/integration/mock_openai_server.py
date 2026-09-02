@@ -134,6 +134,10 @@ class MockRealtimeServer:
                         await self.send_error_response(websocket, payload)
                     elif path == "/invalid-delta-after-done":
                         await self.send_invalid_delta_after_done_response(websocket)
+                    elif path == "/invalid-audio-base64-boundary":
+                        await self.send_invalid_audio_base64_boundary_response(websocket)
+                    elif path == "/invalid-inbound-json":
+                        await self.send_invalid_inbound_json(websocket)
                     elif path == "/barge-in":
                         await self.send_barge_in_response(websocket)
                     elif path == "/reconnect-during-playback":
@@ -215,6 +219,49 @@ class MockRealtimeServer:
             response_id=response_id,
             duration_seconds=duration_seconds,
         )
+
+    async def send_invalid_audio_base64_boundary_response(self, websocket):
+        sample_rate = 24000
+        replacement_frequency = 700
+        replacement_duration = 0.5
+        response_id = "integration-invalid-audio-base64"
+
+        await self.send_audio_delta(websocket, response_id, b"\x7f")
+        # Mid-string padding was partially decoded by the legacy path. Combined with the
+        # orphan byte above, it leaves a carry byte that shifts the replacement PCM stream.
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": response_id,
+                    "delta": "AAAAAA=A",
+                }
+            )
+        )
+        await self.send_audio_delta(
+            websocket,
+            response_id,
+            pcm16_tone(sample_rate, replacement_frequency, replacement_duration),
+        )
+        await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
+        await self.record(
+            "invalid-audio-base64-boundary-sent",
+            replacement_frequency=replacement_frequency,
+            replacement_duration=replacement_duration,
+        )
+
+    async def send_invalid_inbound_json(self, websocket):
+        audio = base64.b64encode(pcm16_tone(24000, frequency=1000, duration_seconds=0.04)).decode("ascii")
+        delta = json.dumps(
+            {
+                "type": "response.output_audio.delta",
+                "delta": audio,
+                "marker": "trailing-inbound-json",
+            }
+        )
+        await websocket.send(delta + "garbage")
+        await websocket.send(delta + "\0garbage")
+        await self.record("invalid-inbound-json-sent")
 
     async def send_reconnect_during_playback_response(self, websocket):
         sample_rate = 24000

@@ -631,6 +631,41 @@ class ModuleIntegrationTest(unittest.TestCase):
 
         self.stop_stream()
 
+    def test_invalid_audio_base64_resets_pcm_boundary(self):
+        self.expect_module_errors("base64 decode error")
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            self.start_stream(f"{MOCK_URL}/invalid-audio-base64-boundary")
+            self.start_recording("invalid-audio-base64-boundary")
+            sent = self.trigger_response("invalid-audio-base64-boundary-sent")
+            stopped = event_socket.wait_for(SPEECH_STOP_EVENT)
+            self.assertIsNotNone(
+                stopped,
+                f"playback did not stop after malformed Base64; observed {event_socket.seen_events}",
+            )
+            sample_rate, samples = self.stop_recording()
+
+        self.assertGreater(audible_duration(samples, sample_rate), 0.35)
+        self.assertAlmostEqual(
+            dominant_frequency(samples, sample_rate),
+            sent["replacement_frequency"],
+            delta=75,
+            msg="PCM carry crossed a rejected Base64 audio delta",
+        )
+        self.stop_stream()
+
+    def test_inbound_json_must_be_complete_and_nul_free(self):
+        self.expect_module_errors("Dropping text WebSocket message containing a NUL byte")
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            self.start_stream(f"{MOCK_URL}/invalid-inbound-json")
+            self.trigger_response("invalid-inbound-json-sent")
+            rejected = event_socket.wait_for(
+                JSON_EVENT,
+                predicate=lambda event: "trailing-inbound-json" in event.get("_body", ""),
+            )
+            self.assertIsNotNone(rejected, "JSON with trailing data was accepted as an audio delta")
+
+        self.stop_stream()
+
     def test_caller_audio_reaches_websocket(self):
         before = len(mock_events())
         self.start_stream(start_muted=False)
@@ -1231,15 +1266,92 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.restart_after_automatic_cleanup()
         self.stop_stream()
 
-    def test_send_json_rejects_invalid_payloads(self):
-        self.expect_module_errors("base64 decode error", "invalid JSON")
+    def test_send_json_validates_and_preserves_payloads(self):
+        self.expect_module_errors(
+            "base64 decode error",
+            "base64 decode error",
+            "invalid JSON",
+            "invalid JSON",
+            "decoded JSON contains a NUL byte",
+            "decoded JSON contains invalid UTF-8",
+        )
         self.start_stream()
 
         assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json %%%=")
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json eyJhIjoxfQ=!")
         invalid_json = base64.b64encode(b'{"type":').decode("ascii")
         assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {invalid_json}")
+        trailing_data = base64.b64encode(b'{"type":"integration.trailing"}garbage').decode("ascii")
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {trailing_data}")
+        embedded_nul = base64.b64encode(b'{"type":"integration.nul"}\0ignored').decode("ascii")
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {embedded_nul}")
+        invalid_utf8 = base64.b64encode(b'{"type":"\xff"}').decode("ascii")
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {invalid_utf8}")
+
+        before = len(mock_events())
+        trailing_whitespace = base64.b64encode(b'{"type":"integration.whitespace"} \r\n\t').decode("ascii")
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {trailing_whitespace}")
+        delivered = wait_for_event(
+            lambda event: event.get("event") == "message" and event.get("type") == "integration.whitespace",
+            before,
+        )
+        self.assertIsNotNone(delivered, "valid JSON with trailing whitespace was rejected")
+
+        before = len(mock_events())
+        exact_payload = b'{"type":"integration.preserved","value":9007199254740993,"text":"a\\u0000b"}'
+        assert_ok(
+            self,
+            f"uuid_openai_audio_stream {self.uuid} send_json {base64.b64encode(exact_payload).decode('ascii')}",
+        )
+        preserved = wait_for_event(
+            lambda event: event.get("event") == "message" and event.get("type") == "integration.preserved",
+            before,
+        )
+        self.assertIsNotNone(preserved, "valid JSON payload was not delivered")
+        self.assertEqual(preserved["payload"]["value"], 9007199254740993)
+        self.assertEqual(preserved["payload"]["text"], "a\0b")
 
         self.stop_stream()
+
+    def test_send_json_rejects_invalid_token_syntax(self):
+        invalid_payloads = (
+            b'{"value":01}',
+            b'{"value":-.1}',
+            b'{"value":1.}',
+            b'{"value":1e+}',
+            b'{"value":"a\nb"}',
+            b'{"value":"a\tb"}',
+            b'{"value":"\\x20"}',
+            b'\f{}\v',
+        )
+        self.expect_module_errors(*("invalid JSON" for _ in invalid_payloads))
+        self.start_stream()
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                encoded = base64.b64encode(payload).decode("ascii")
+                assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {encoded}")
+        self.stop_stream()
+
+    def test_stop_rejects_invalid_json_token_syntax(self):
+        self.expect_module_errors("invalid JSON")
+        self.start_stream()
+        before = len(mock_events())
+        encoded = base64.b64encode(b'{"value":01}').decode("ascii")
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} stop {encoded}")
+        self.assertIsNotNone(
+            wait_for_event(lambda event: event.get("event") == "disconnected", before),
+            "WebSocket did not disconnect after rejecting the final payload",
+        )
+
+    def test_stop_rejects_invalid_utf8_final_payload(self):
+        self.expect_module_errors("decoded JSON contains invalid UTF-8")
+        self.start_stream()
+
+        before = len(mock_events())
+        invalid_utf8 = base64.b64encode(b'{"type":"\xff"}').decode("ascii")
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} stop {invalid_utf8}")
+        disconnected = wait_for_event(lambda event: event.get("event") == "disconnected", before)
+        self.assertIsNotNone(disconnected, "WebSocket did not disconnect after rejecting the final payload")
 
     def test_all_mute_controls_both_audio_directions(self):
         capture_rate = 24000

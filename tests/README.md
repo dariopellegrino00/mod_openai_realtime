@@ -60,6 +60,10 @@ audio buffered before a dropped or initially failed connection cannot reach the 
 checks actionable connection-error diagnostics and payload suppression in logs without event suppression.
 Suppression is verified as a per-stream setting captured at start, including for transport connection errors.
 Malformed or sample-misaligned data observed by the mock is rejected.
+Outbound JSON commands reject malformed Base64, invalid UTF-8, embedded NUL bytes, and trailing non-JSON data; the
+same validation applies to the optional final payload sent during stream teardown. Valid command payloads retain
+their original numeric and string values. Inbound JSON must be complete and free of raw NUL bytes, and malformed
+Base64 audio deltas cannot carry partial PCM state into later playback.
 
 ```sh
 ./tests/run-integration.sh
