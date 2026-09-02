@@ -54,8 +54,9 @@ Raw mode is covered in both directions, including binary PCM playback split acro
 The raw playback suite verifies that PCM carry and resampler state do not cross an interrupted stream boundary, and
 that PCM carry is reset after a discarded oversized binary frame.
 Capture tests verify configured packet aggregation, mono/stereo channel separation, user mute/unmute semantics, and
-WebSocket header precedence.
-The suite also checks automatic reconnection and rejects malformed or sample-misaligned data observed by the mock.
+WebSocket header precedence. Reconnection tests hold the handshake while the capture source changes, proving that
+audio buffered before a dropped or initially failed connection cannot reach the next connection. The suite also
+rejects malformed or sample-misaligned data observed by the mock.
 
 ```sh
 ./tests/run-integration.sh

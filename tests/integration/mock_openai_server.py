@@ -6,9 +6,10 @@ import json
 import math
 import struct
 import time
+from http import HTTPStatus
 from pathlib import Path
 
-import websockets
+from websockets.legacy.server import serve
 
 
 def pcm16_tone(sample_rate, frequency, duration_seconds, amplitude=12000, start_sample=0):
@@ -20,24 +21,14 @@ def pcm16_tone(sample_rate, frequency, duration_seconds, amplitude=12000, start_
     return struct.pack(f"<{sample_count}h", *samples)
 
 
-def request_metadata(websocket, legacy_path=None):
-    """Return the request path and headers across websockets 10.x and 14+."""
-    request = getattr(websocket, "request", None)
-    path = legacy_path or getattr(websocket, "path", None) or getattr(request, "path", "/")
-    headers = getattr(websocket, "request_headers", None)
-    if headers is None:
-        headers = getattr(request, "headers", None)
-    if headers is None:
-        raise RuntimeError("unsupported websockets request API: request headers are unavailable")
-    return path, headers
-
-
 class MockRealtimeServer:
     def __init__(self, event_log: Path, ready_file: Path):
         self.event_log = event_log
         self.ready_file = ready_file
+        self.reconnect_gate = event_log.with_name("mod-openai-reconnect-gate")
         self._lock = asyncio.Lock()
         self._connection_counts = {}
+        self._handshake_counts = {}
 
     async def record(self, event, **fields):
         payload = {"event": event, **fields}
@@ -45,8 +36,29 @@ class MockRealtimeServer:
             with self.event_log.open("a", encoding="utf-8") as log:
                 log.write(json.dumps(payload, sort_keys=True) + "\n")
 
-    async def handle(self, websocket, path=None):
-        path, headers = request_metadata(websocket, path)
+    async def process_request(self, path, _request_headers):
+        handshake_number = self._handshake_counts.get(path, 0) + 1
+        self._handshake_counts[path] = handshake_number
+        if path == "/gated-initial-connect" and handshake_number == 1:
+            await self.record("handshake-rejected", path=path, handshake_number=handshake_number)
+            body = b"retry connection"
+            return (
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))],
+                body,
+            )
+        if (
+            path in {"/gated-reconnect", "/gated-initial-connect"}
+            and handshake_number > 1
+            and not self.reconnect_gate.exists()
+        ):
+            await self.record("reconnect-blocked", path=path, handshake_number=handshake_number)
+            while not self.reconnect_gate.exists():
+                await asyncio.sleep(0.01)
+        return None
+
+    async def handle(self, websocket, path):
+        headers = websocket.request_headers
         connection_number = self._connection_counts.get(path, 0) + 1
         self._connection_counts[path] = connection_number
         await self.record(
@@ -69,7 +81,13 @@ class MockRealtimeServer:
 
             async for message in websocket:
                 if isinstance(message, bytes):
-                    await self.record("binary", size=len(message), sample_aligned=len(message) % 2 == 0)
+                    await self.record(
+                        "binary",
+                        path=path,
+                        connection_number=connection_number,
+                        size=len(message),
+                        sample_aligned=len(message) % 2 == 0,
+                    )
                     continue
 
                 try:
@@ -79,7 +97,7 @@ class MockRealtimeServer:
                     continue
 
                 message_type = payload.get("type", "")
-                if path == "/close-on-command" and message_type == "integration.close":
+                if path in {"/close-on-command", "/gated-reconnect"} and message_type == "integration.close":
                     await websocket.close(code=1011, reason="intentional paused-close integration test")
                     await self.record("closed", path=path, connection_number=connection_number)
                     return
@@ -393,7 +411,14 @@ class MockRealtimeServer:
     async def run(self, host, port):
         self.event_log.unlink(missing_ok=True)
         self.ready_file.unlink(missing_ok=True)
-        async with websockets.serve(self.handle, host, port, max_size=16 * 1024 * 1024):
+        self.reconnect_gate.unlink(missing_ok=True)
+        async with serve(
+            self.handle,
+            host,
+            port,
+            max_size=16 * 1024 * 1024,
+            process_request=self.process_request,
+        ):
             self.ready_file.touch()
             await asyncio.Future()
 

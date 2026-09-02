@@ -15,6 +15,7 @@ from pathlib import Path
 
 MOCK_URL = "ws://127.0.0.1:18080"
 EVENT_LOG = Path("/tmp/mod-openai-mock-events.jsonl")
+RECONNECT_GATE = EVENT_LOG.with_name("mod-openai-reconnect-gate")
 PLAYBACK_DRAIN_MARGIN_SECONDS = 0.4
 PLAYBACK_DURATION_TOLERANCE_SECONDS = 0.1
 FREESWITCH_LOG = Path(os.environ.get("FREESWITCH_RUNTIME_LOG", "/tmp/mod-openai-freeswitch.log"))
@@ -336,6 +337,42 @@ class ModuleIntegrationTest(unittest.TestCase):
         source = f"tone_stream://%(10000,0,{frequency});loops=-1"
         assert_ok(self, f"uuid_displace {self.uuid} start {source} 0 rm")
         return source
+
+    def assert_gated_reconnect_discards_capture_backlog(self, path, start_index, tone_source):
+        blocked = wait_for_event(
+            lambda event: event.get("event") == "reconnect-blocked" and event.get("path") == path,
+            start_index,
+            timeout=10,
+        )
+        self.assertIsNotNone(blocked, "mock did not hold the reconnect while the capture source changed")
+
+        try:
+            backlog_accumulation_seconds = 0.25
+            time.sleep(backlog_accumulation_seconds)
+            assert_ok(self, f"uuid_displace {self.uuid} stop {tone_source}")
+            quiet_capture_seconds = 0.25
+            time.sleep(quiet_capture_seconds)
+        finally:
+            RECONNECT_GATE.touch()
+
+        reconnected = wait_for_event(
+            lambda event: event.get("event") == "connected" and event.get("path") == path,
+            start_index,
+            timeout=10,
+        )
+        self.assertIsNotNone(reconnected, "module did not reconnect after the capture stream was interrupted")
+        first_capture = wait_for_event(
+            lambda event: event.get("event") == "audio-received"
+            and event.get("path") == path
+            and event.get("connection_number") == reconnected["connection_number"],
+            start_index,
+        )
+        self.assertIsNotNone(first_capture, "module did not resume capture after reconnect")
+        self.assertLess(
+            first_capture["peak_amplitude"],
+            AUDIBLE_SAMPLE_THRESHOLD,
+            "audible pre-reconnect capture reached the new connection",
+        )
 
     def module_error_lines(self):
         with FREESWITCH_LOG.open("rb") as log:
@@ -860,6 +897,105 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(reconnected, "module did not reconnect after a transient peer failure")
 
         self.trigger_response("audio-response-sent")
+        self.stop_stream()
+
+    def test_reconnect_discards_capture_residue_before_control_flush(self):
+        self.start_read_tone()
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_BUFFER_SIZE 1000")
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT false")
+
+        self.start_stream(f"{MOCK_URL}/close-on-command", start_muted=False)
+        time.sleep(0.2)
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} pause")
+
+        before_close = len(mock_events())
+        close_message = encode_json({"type": "integration.close"})
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {close_message}")
+        closed = wait_for_event(
+            lambda event: event.get("event") == "closed" and event.get("path") == "/close-on-command",
+            before_close,
+        )
+        self.assertIsNotNone(closed, "mock peer did not close the capture stream")
+        reconnected = wait_for_event(
+            lambda event: event.get("event") == "connected",
+            before_close,
+            timeout=10,
+        )
+        self.assertIsNotNone(reconnected, "module did not reconnect after the capture stream was interrupted")
+        reconnected_path = reconnected["path"]
+        reconnected_number = reconnected["connection_number"]
+
+        before = len(mock_events())
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} mute user")
+        silence = wait_for_event(
+            lambda event: event.get("event") == "audio-received"
+            and event.get("path") == reconnected_path
+            and event.get("connection_number") == reconnected_number
+            and event.get("all_zero"),
+            before,
+        )
+        self.assertIsNotNone(silence, "mute user did not send silence after reconnect")
+        stale_audio = [
+            event
+            for event in mock_events()[before:]
+            if event.get("event") == "audio-received"
+            and event.get("path") == reconnected_path
+            and event.get("connection_number") == reconnected_number
+            and event.get("peak_amplitude", 0) >= AUDIBLE_SAMPLE_THRESHOLD
+        ]
+        self.assertEqual(stale_audio, [], "capture residue from the dropped connection reached the new connection")
+        self.stop_stream()
+
+    def test_reconnect_discards_media_bug_capture_backlog(self):
+        RECONNECT_GATE.unlink(missing_ok=True)
+        self.addCleanup(RECONNECT_GATE.unlink, missing_ok=True)
+        tone_source = self.start_read_tone()
+        capture_buffer_ms = 200
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_BUFFER_SIZE {capture_buffer_ms}")
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT false")
+
+        path = "/gated-reconnect"
+        before_start = len(mock_events())
+        self.start_stream(f"{MOCK_URL}{path}", start_muted=False)
+        audible_capture = wait_for_event(
+            lambda event: event.get("event") == "audio-received"
+            and event.get("path") == path
+            and event.get("peak_amplitude", 0) >= AUDIBLE_SAMPLE_THRESHOLD,
+            before_start,
+        )
+        self.assertIsNotNone(audible_capture, "read-side test tone did not reach the WebSocket")
+
+        before_close = len(mock_events())
+        close_message = encode_json({"type": "integration.close"})
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {close_message}")
+        closed = wait_for_event(
+            lambda event: event.get("event") == "closed" and event.get("path") == path,
+            before_close,
+        )
+        self.assertIsNotNone(closed, "mock peer did not close the active capture stream")
+
+        self.assert_gated_reconnect_discards_capture_backlog(path, before_close, tone_source)
+        self.stop_stream()
+
+    def test_initial_connection_retry_discards_capture_backlog(self):
+        self.expect_module_errors("WebSocket connection error:")
+        RECONNECT_GATE.unlink(missing_ok=True)
+        self.addCleanup(RECONNECT_GATE.unlink, missing_ok=True)
+        tone_source = self.start_read_tone()
+        capture_buffer_ms = 200
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_BUFFER_SIZE {capture_buffer_ms}")
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT false")
+
+        path = "/gated-initial-connect"
+        before_start = len(mock_events())
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} start {MOCK_URL}{path} mono 24k")
+        rejected = wait_for_event(
+            lambda event: event.get("event") == "handshake-rejected" and event.get("path") == path,
+            before_start,
+        )
+        self.assertIsNotNone(rejected, "mock did not reject the initial WebSocket handshake")
+
+        self.assert_gated_reconnect_discards_capture_backlog(path, before_start, tone_source)
         self.stop_stream()
 
     def test_reconnect_preserves_completed_playback_lifecycle(self):

@@ -295,26 +295,10 @@ class AudioStreamer {
                 case CONNECTION_DROPPED:
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO, "connection closed\n");
                     m_notify(psession, EVENT_DISCONNECT, message);
-
-                    // Any aggregated capture residue belongs to the dropped connection: have the
-                    // media thread discard it instead of mixing it with audio sent after a reconnect
-                    request_capture_reset();
-
-                    if (!webSocket.isAutomaticReconnectionEnabled()) {
-                        // No more audio can arrive: let write_frame drain the tail, then tear down
-                        m_response_audio_done = true;
-                        m_terminal_close = true;
-                    }
-
                     break;
                 case CONNECT_ERROR:
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO, "connection error\n");
                     m_notify(psession, EVENT_ERROR, message);
-
-                    if (!webSocket.isAutomaticReconnectionEnabled()) {
-                        request_media_bug_close();
-                    }
-
                     break;
                 case MESSAGE: {
                     std::string msg(message);
@@ -330,6 +314,22 @@ class AudioStreamer {
                 }
             }
             switch_core_session_rwunlock(psession);
+        }
+
+        if (event == CONNECTION_DROPPED) {
+            // Any aggregated capture residue belongs to the dropped connection: have the
+            // media thread discard it instead of mixing it with audio sent after a reconnect.
+            request_capture_reset();
+            if (!webSocket.isAutomaticReconnectionEnabled()) {
+                // No more audio can arrive: let write_frame drain the tail, then tear down.
+                m_response_audio_done = true;
+                m_terminal_close = true;
+            }
+        } else if (event == CONNECT_ERROR) {
+            request_capture_reset();
+            if (!webSocket.isAutomaticReconnectionEnabled()) {
+                request_media_bug_close();
+            }
         }
     }
 
@@ -711,7 +711,11 @@ class AudioStreamer {
         m_capture_reset_pending.store(true, std::memory_order_release);
     }
 
-    // Returns true once per pending reset request; media (stream_frame) thread only
+    bool capture_reset_pending() const {
+        return m_capture_reset_pending.load(std::memory_order_acquire);
+    }
+
+    // Returns true once per pending reset request; media (stream_frame) thread only.
     bool consume_capture_reset() {
         return m_capture_reset_pending.exchange(false, std::memory_order_acq_rel);
     }
@@ -777,7 +781,7 @@ class AudioStreamer {
     std::atomic<bool> m_response_audio_done{false};
     std::atomic<bool> m_terminal_close{false};        // connection closed and no reconnection will be attempted
     std::atomic<bool> m_send_failure_logged{false};   // rate-limits the dropped-audio warning to once per episode
-    std::atomic<bool> m_capture_reset_pending{false}; // drop stale capture residue after a connection drop
+    std::atomic<bool> m_capture_reset_pending{false}; // discard capture predating the next successful connection
     std::atomic<bool> m_started{false};
     bool m_raw_audio_mode = false;
     private_t *m_context = nullptr;      // owner context; valid until the WebSocket thread has been joined
@@ -983,6 +987,18 @@ bool capture_is_paused_or_muted(private_t *tech_pvt) {
     return switch_atomic_read(&tech_pvt->audio_paused) || switch_atomic_read(&tech_pvt->user_audio_muted);
 }
 
+// Observe the reset without consuming it: only stream_frame can also flush the media-bug source.
+// Callers are serialized by tech_pvt->mutex.
+bool discard_capture_residue_on_pending_reset(private_t *tech_pvt, AudioStreamer *streamer) {
+    if (streamer && streamer->capture_reset_pending()) {
+        if (tech_pvt->sbuffer) {
+            switch_buffer_zero(tech_pvt->sbuffer);
+        }
+        return true;
+    }
+    return false;
+}
+
 bool reset_capture_resampler(private_t *tech_pvt) {
     if (!tech_pvt->resampler) {
         return true;
@@ -997,17 +1013,20 @@ bool reset_capture_resampler(private_t *tech_pvt) {
 }
 
 // Send any residual aggregated capture audio, then clear the aggregator.
-// The residue is dropped if the WebSocket is not connected. Caller must hold tech_pvt->mutex.
-void flush_capture_residue(private_t *tech_pvt) {
+// Returns true when a connection reset discarded the residue. Caller must hold tech_pvt->mutex.
+bool flush_capture_residue(private_t *tech_pvt) {
+    StreamRuntime *runtime = stream_runtime(tech_pvt);
+    AudioStreamer *streamer = runtime ? runtime->streamer() : nullptr;
+    if (discard_capture_residue_on_pending_reset(tech_pvt, streamer)) {
+        return true;
+    }
     if (!tech_pvt->sbuffer) {
-        return;
+        return false;
     }
     switch_size_t inuse = switch_buffer_inuse(tech_pvt->sbuffer);
     if (inuse == 0) {
-        return;
+        return false;
     }
-    StreamRuntime *runtime = stream_runtime(tech_pvt);
-    AudioStreamer *streamer = runtime ? runtime->streamer() : nullptr;
     if (streamer && streamer->isConnected()) {
         StreamBuffers& buffers = runtime->buffers();
         buffers.flush_buffer.resize(inuse);
@@ -1015,6 +1034,7 @@ void flush_capture_residue(private_t *tech_pvt) {
         streamer->sendAudio(buffers.flush_buffer.data(), inuse);
     }
     switch_buffer_zero(tech_pvt->sbuffer);
+    return false;
 }
 
 struct SessionContext {
@@ -1458,15 +1478,27 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
         return SWITCH_TRUE;
     }
 
-    // Discard any capture residue left over from a dropped connection
-    if (streamer->consume_capture_reset() && tech_pvt->sbuffer) {
-        switch_buffer_zero(tech_pvt->sbuffer);
+    // Drop every layer that can retain capture from the previous connection.
+    if (streamer->consume_capture_reset()) {
+        if (tech_pvt->sbuffer) {
+            switch_buffer_zero(tech_pvt->sbuffer);
+        }
+        switch_core_media_bug_flush(bug);
+        reset_capture_resampler(tech_pvt);
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                          "(%s) discarded stale capture state after WebSocket reconnect\n", tech_pvt->sessionId);
+        switch_mutex_unlock(tech_pvt->mutex);
+        return SWITCH_TRUE;
     }
 
     // Persistent buffers are direct runtime members and live for the whole session.
     StreamBuffers& buffers = runtime->buffers();
 
     auto send_or_buffer_audio = [tech_pvt, streamer](const uint8_t *data, size_t length) {
+        if (discard_capture_residue_on_pending_reset(tech_pvt, streamer)) {
+            return false;
+        }
+
         if (tech_pvt->rtp_packets == 1) {
             streamer->sendAudio(data, length);
             return true;
@@ -1475,7 +1507,9 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
         while (length > 0) {
             switch_size_t free_space = switch_buffer_freespace(tech_pvt->sbuffer);
             if (free_space == 0) {
-                flush_capture_residue(tech_pvt);
+                if (flush_capture_residue(tech_pvt)) {
+                    return false;
+                }
                 free_space = switch_buffer_freespace(tech_pvt->sbuffer);
                 if (free_space == 0) {
                     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
@@ -1494,7 +1528,9 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
             data += write_len;
             length -= write_len;
             if (switch_buffer_freespace(tech_pvt->sbuffer) == 0) {
-                flush_capture_residue(tech_pvt);
+                if (flush_capture_residue(tech_pvt)) {
+                    return false;
+                }
             }
         }
 
@@ -1505,7 +1541,8 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
     frame.data = buffers.data_buf.data();
     frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
 
-    while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
+    bool capture_aborted = false;
+    while (!capture_aborted && switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
         if (frame.datalen == 0 || frame.samples == 0) {
             continue;
         }
@@ -1556,6 +1593,7 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
             if (bytes_written > 0 &&
                 !send_or_buffer_audio(reinterpret_cast<const uint8_t *>(buffers.resample_buffer.data()),
                                       bytes_written)) {
+                capture_aborted = true;
                 break;
             }
 
@@ -1568,6 +1606,9 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
 
             input += static_cast<size_t>(in_len) * tech_pvt->channels;
             remaining_samples -= in_len;
+        }
+        if (capture_aborted) {
+            break;
         }
     }
 
