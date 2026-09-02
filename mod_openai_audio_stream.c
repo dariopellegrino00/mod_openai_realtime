@@ -1,5 +1,5 @@
 /*
- * Openai mod_openai_audio_stream FreeSWITCH module to stream audio to websocket and receive responses from OpenAI
+ * OpenAI mod_openai_audio_stream FreeSWITCH module to stream audio to WebSocket and receive responses from OpenAI
  * Realtime API.
  */
 #include "mod_openai_audio_stream.h"
@@ -61,17 +61,16 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
         case SWITCH_ABC_TYPE_INIT:
             break;
 
-        case SWITCH_ABC_TYPE_CLOSE: {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Got SWITCH_ABC_TYPE_CLOSE.\n");
+        case SWITCH_ABC_TYPE_CLOSE:
             stream_session_cleanup(session, NULL, 1);
-        } break;
+            break;
 
         case SWITCH_ABC_TYPE_READ:
             if (switch_atomic_read(&tech_pvt->close_requested)) {
                 return SWITCH_FALSE;
             }
             return stream_frame(bug);
-        case SWITCH_ABC_TYPE_WRITE_REPLACE: // This is where the mediabug will write audio data to the channel
+        case SWITCH_ABC_TYPE_WRITE_REPLACE:
             if (switch_atomic_read(&tech_pvt->close_requested)) {
                 return SWITCH_FALSE;
             }
@@ -145,20 +144,17 @@ static switch_status_t start_capture(switch_core_session_t *session, switch_medi
         .start_muted = start_muted,
         .force_raw_audio_mode = force_raw_audio_mode,
     };
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "calling stream_session_init.\n");
     if (SWITCH_STATUS_FALSE == stream_session_init(session, responseHandler, &options, &pUserData)) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "Error initializing mod_openai_audio_stream session.\n");
         return SWITCH_STATUS_FALSE;
     }
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "adding bug.\n");
     if ((status = switch_core_media_bug_add(session, MY_BUG_NAME, NULL, capture_callback, pUserData, 0, flags, &bug)) !=
         SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error adding media bug.\n");
         stream_session_release(pUserData);
         return status;
     }
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "setting bug private data.\n");
     switch_channel_set_private(channel, MY_BUG_NAME, bug);
 
     if (stream_session_start(pUserData) != SWITCH_STATUS_SUCCESS) {
@@ -167,7 +163,6 @@ static switch_status_t start_capture(switch_core_session_t *session, switch_medi
         return SWITCH_STATUS_FALSE;
     }
 
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "exiting start_capture.\n");
     return SWITCH_STATUS_SUCCESS;
 }
 
@@ -504,10 +499,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_openai_audio_stream_load) {
 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_openai_audio_stream API loading..\n");
 
-    /* connect my internal structure to the blank pointer passed to me */
     *module_interface = switch_loadable_module_create_module_interface(pool, modname);
 
-    /* create/register custom event message types */
     if (switch_event_reserve_subclass(EVENT_JSON) != SWITCH_STATUS_SUCCESS ||
         switch_event_reserve_subclass(EVENT_CONNECT) != SWITCH_STATUS_SUCCESS ||
         switch_event_reserve_subclass(EVENT_ERROR) != SWITCH_STATUS_SUCCESS ||
@@ -541,13 +534,9 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_openai_audio_stream_load) {
 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_openai_audio_stream API successfully loaded\n");
 
-    /* indicate that the module should continue to be loaded */
     return SWITCH_STATUS_SUCCESS;
 }
 
-/*
-  Called when the system shuts down
-  Macro expands to: switch_status_t mod_openai_audio_stream_shutdown() */
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_openai_audio_stream_shutdown) {
     free_event_subclasses();
 

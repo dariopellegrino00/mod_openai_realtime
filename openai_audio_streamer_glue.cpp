@@ -5,6 +5,8 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -492,7 +494,7 @@ class AudioStreamer {
                 char *jsonString = cJSON_PrintUnformatted(payload);
                 if (jsonString) {
                     m_notify(psession, EVENT_PLAY, jsonString);
-                    free(jsonString);
+                    std::free(jsonString);
                 }
                 cJSON_Delete(payload);
             }
@@ -553,7 +555,7 @@ class AudioStreamer {
                 m_notify(session, EVENT_PLAY, serialized);
             }
             message.assign(serialized);
-            free(serialized);
+            std::free(serialized);
         }
 
         if (resampled.empty()) {
@@ -658,7 +660,6 @@ class AudioStreamer {
         if (!m_started.exchange(false)) {
             return;
         }
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "disconnecting...\n");
         try {
             webSocket.stop();
         } catch (const std::exception& e) {
@@ -722,7 +723,7 @@ class AudioStreamer {
 
     void deleteFiles() {
         for (const auto& fileName : m_Files) {
-            remove(fileName.c_str());
+            std::remove(fileName.c_str());
         }
     }
 
@@ -978,14 +979,10 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
                           "(%s) no resampling needed for this call\n", tech_pvt->sessionId);
     }
 
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_data_init\n",
-                      tech_pvt->sessionId);
-
     return SWITCH_STATUS_SUCCESS;
 }
 
 void destroy_tech_pvt(private_t *tech_pvt) {
-    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "%s destroy_tech_pvt\n", tech_pvt->sessionId);
     if (tech_pvt->cpp_context) {
         delete stream_runtime(tech_pvt);
         tech_pvt->cpp_context = nullptr;
@@ -1520,7 +1517,6 @@ switch_bool_t stream_frame(switch_media_bug_t *bug) {
         return SWITCH_TRUE;
     }
 
-    // Persistent buffers are direct runtime members and live for the whole session.
     StreamBuffers& buffers = runtime->buffers();
 
     auto send_or_buffer_audio = [tech_pvt, streamer](const uint8_t *data, size_t length) {
@@ -1710,7 +1706,7 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
         chunk_enqueued = true;
     }
     if (!chunk_enqueued && inuse == 0) {
-        // Openai just finished speaking for interruption or end of response
+        // A completed response stops speaking only after its final queued sample drains.
         if (as->is_openai_speaking() && as->is_response_audio_done()) {
             as->openai_speech_stopped(session);
         }
@@ -1764,7 +1760,8 @@ switch_status_t stream_session_cleanup(switch_core_session_t *session, char *tex
         char sessionId[MAX_SESSION_ID];
 
         if (!tech_pvt) {
-            // should not happen: the bug is always created with user data
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "stream_session_cleanup: media bug has no session data\n");
             switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
             if (!channelIsClosing && switch_core_media_bug_remove(session, &bug) != SWITCH_STATUS_SUCCESS) {
                 switch_channel_set_private(channel, MY_BUG_NAME, bug);
@@ -1776,8 +1773,6 @@ switch_status_t stream_session_cleanup(switch_core_session_t *session, char *tex
         sessionId[MAX_SESSION_ID - 1] = '\0';
 
         switch_mutex_lock(tech_pvt->mutex);
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_session_cleanup\n",
-                          sessionId);
 
         // Deliver the residual aggregated capture audio before the final JSON and the teardown,
         // so a final commit/response request sees all the audio captured so far
@@ -1804,9 +1799,6 @@ switch_status_t stream_session_cleanup(switch_core_session_t *session, char *tex
 
         switch_mutex_unlock(tech_pvt->mutex);
         destroy_tech_pvt(tech_pvt);
-
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-                          "(%s) stream_session_cleanup: connection closed\n", sessionId);
         return status;
     }
 

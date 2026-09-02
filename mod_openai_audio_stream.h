@@ -1,7 +1,6 @@
 #ifndef MOD_OPENAI_AUDIO_STREAM_H
 #define MOD_OPENAI_AUDIO_STREAM_H
 
-#include <limits.h>
 #include <stdint.h>
 
 #include <speex/speex_resampler.h>
