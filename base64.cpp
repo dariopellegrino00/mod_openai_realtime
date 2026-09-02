@@ -31,6 +31,9 @@
 
 */
 
+// Local modifications for mod_openai_realtime: formatted to the project style and adjusted
+// implementation types to satisfy the project's compiler and static-analysis checks.
+
 #include "base64.h"
 
 #include <algorithm>
