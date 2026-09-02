@@ -143,6 +143,8 @@ class MockRealtimeServer:
                         await self.send_debug_audio_response(websocket)
                     elif path == "/raw-audio":
                         await self.send_raw_audio_response(websocket)
+                    elif path == "/raw-audio-debug":
+                        await self.send_raw_audio_debug_response(websocket)
                     elif path == "/raw-audio-boundary":
                         await self.send_raw_audio_boundary_response(websocket)
                     elif path == "/raw-audio-oversized-boundary":
@@ -343,7 +345,9 @@ class MockRealtimeServer:
         sample_rate = 24000
         response_id = "integration-debug-audio-response"
         audio = pcm16_tone(sample_rate, 1000, 0.1)
-        await self.send_audio_delta(websocket, response_id, audio)
+        # Split one PCM16 sample across deltas so debug output must follow decoder alignment.
+        await self.send_audio_delta(websocket, response_id, audio[:1])
+        await self.send_audio_delta(websocket, response_id, audio[1:])
         await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
         await self.record("debug-audio-response-sent", sample_rate=sample_rate, byte_count=len(audio))
 
@@ -406,6 +410,18 @@ class MockRealtimeServer:
             "raw-audio-oversized-boundary-response-sent",
             replacement_frequency=replacement_frequency,
             replacement_duration=replacement_duration,
+        )
+
+    async def send_raw_audio_debug_response(self, websocket):
+        sample_rate = 8000
+        audio = pcm16_tone(sample_rate, frequency=600, duration_seconds=0.04)
+        await websocket.send(audio[:1])
+        await websocket.send(audio[1:])
+        await websocket.send(json.dumps({"type": "response.output_audio.done"}))
+        await self.record(
+            "raw-audio-debug-response-sent",
+            sample_rate=sample_rate,
+            byte_count=len(audio),
         )
 
     async def run(self, host, port):

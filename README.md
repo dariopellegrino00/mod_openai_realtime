@@ -149,6 +149,7 @@ The module bounds application-level peer processing and playback memory:
 - After IXWebSocket has assembled an inbound text or binary message, payloads larger than 8 MiB are dropped before JSON, Base64, or PCM processing. This does not bound WebSocket transport aggregation or decompression.
 - JSON messages nested deeper than 128 levels are dropped.
 - Decoded playback audio is queued up to 180 seconds. Audio that would exceed this capacity is dropped; overflow logging is re-enabled after the backlog falls below half capacity.
+- Debug WAV files accumulate until stream cleanup, with no per-stream disk limit. Set `STREAM_DISABLE_AUDIOFILES=true` to disable them.
 
 ## Raw Audio Mode
 
@@ -380,7 +381,12 @@ In raw audio mode, binary PCM frames only carry audio data. Control and lifecycl
 }
 ```
 
-By default, the module writes received PCM16 playback chunks as temporary WAV files using the configured playback sample rate. For a JSON audio delta, `mod_openai_audio_stream::play` preserves the other fields, removes the Base64 `delta`, and adds `file`. A raw binary chunk produces an event containing only `file`. Raw fragments split inside a PCM16 sample are joined before a debug file is emitted, so a binary message does not necessarily map one-to-one to a WAV.
+By default, the module writes received PCM16 playback chunks as temporary WAV files using the configured playback
+sample rate. For a JSON audio delta, `mod_openai_audio_stream::play` preserves the other fields, removes the Base64
+`delta`, and adds `file`. A raw binary chunk produces an event containing only `file`. PCM16 samples split across
+consecutive JSON deltas or raw binary frames are joined before a debug file is emitted, so an input message does not
+necessarily map one-to-one to a WAV.
+The `play` event reports file creation, not whether the audio reached the caller.
 
 ```json
 {

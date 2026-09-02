@@ -769,6 +769,11 @@ class ModuleIntegrationTest(unittest.TestCase):
             self.assertEqual(recording.getsampwidth(), 2)
             self.assertEqual(recording.getframerate(), sent["sample_rate"])
             self.assertEqual(recording.getnframes() * recording.getsampwidth(), sent["byte_count"])
+        self.assertEqual(
+            list(temp_dir.glob(f"{self.uuid}_*.tmp.wav")),
+            [debug_file],
+            "a partial PCM16 fragment produced its own debug WAV",
+        )
 
         self.stop_stream()
         self.assertTrue(wait_until(lambda: not debug_file.exists()), "debug WAV survived stream teardown")
@@ -861,6 +866,44 @@ class ModuleIntegrationTest(unittest.TestCase):
             msg="PCM carry crossed an oversized raw frame",
         )
         self.stop_stream(stream_api=stream_api)
+
+    def test_raw_debug_wav_contains_only_complete_pcm16_samples(self):
+        stream_api = "uuid_raw_audio_stream"
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_DISABLE_AUDIOFILES false")
+        temp_dir = Path(api("global_getvar temp_dir"))
+        debug_pattern = f"{self.uuid}_*.tmp.wav"
+
+        self.start_stream(
+            f"{MOCK_URL}/raw-audio-debug",
+            stream_api=stream_api,
+            playback_rate="8k",
+        )
+        sent = self.trigger_response("raw-audio-debug-response-sent", stream_api=stream_api)
+
+        def debug_payload_bytes():
+            try:
+                return sum(
+                    len(read_mono_pcm16(path)[1]) * PCM16_BYTES_PER_SAMPLE
+                    for path in temp_dir.glob(debug_pattern)
+                )
+            except (EOFError, wave.Error):
+                return -1
+
+        self.assertTrue(
+            wait_until(lambda: debug_payload_bytes() == sent["byte_count"]),
+            "raw debug WAVs did not preserve the complete PCM16 stream",
+        )
+        debug_files = list(temp_dir.glob(debug_pattern))
+        self.assertEqual(len(debug_files), 1, "a partial PCM16 fragment produced its own debug WAV")
+        sample_rate, samples = read_mono_pcm16(debug_files[0])
+        self.assertEqual(sample_rate, sent["sample_rate"])
+        self.assertEqual(len(samples) * PCM16_BYTES_PER_SAMPLE, sent["byte_count"])
+
+        self.stop_stream(stream_api=stream_api)
+        self.assertTrue(
+            wait_until(lambda: not list(temp_dir.glob(debug_pattern))),
+            "raw debug WAV survived stream teardown",
+        )
 
     def test_double_start_is_rejected(self):
         self.expect_module_errors("bug already attached")

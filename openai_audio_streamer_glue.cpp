@@ -205,10 +205,11 @@ class AudioStreamer {
             return;
         }
 
-        if (!m_disable_audiofiles) {
-            saveDebugAudioFile(message->str, true);
+        std::string aligned_audio;
+        auto converted = convertRawAudio(message->str, m_disable_audiofiles ? nullptr : &aligned_audio);
+        if (!m_disable_audiofiles && !aligned_audio.empty()) {
+            saveDebugAudioFile(aligned_audio, true);
         }
-        auto converted = convertRawAudio(message->str);
         if (!converted.empty()) {
             m_response_audio_done = false;
             push_audio_queue(std::move(converted));
@@ -333,7 +334,10 @@ class AudioStreamer {
         }
     }
 
-    std::vector<int16_t> convertRawAudio(const std::string& input_raw) {
+    std::vector<int16_t> convertRawAudio(const std::string& input_raw, std::string *aligned_raw = nullptr) {
+        if (aligned_raw) {
+            aligned_raw->clear();
+        }
         // Frames are segments of a continuous PCM16 stream: an odd frame length must not shift
         // the sample alignment of the following frames, so carry the trailing byte over
         const char *data = input_raw.data();
@@ -354,6 +358,9 @@ class AudioStreamer {
         }
         if (size == 0) {
             return {};
+        }
+        if (aligned_raw) {
+            aligned_raw->assign(data, size);
         }
         size_t in_samples = size / 2;
 
@@ -517,9 +524,11 @@ class AudioStreamer {
         // events and logs (the README documents EVENT_PLAY as replacing it with the file path).
         cJSON_DeleteItemFromObject(json, "delta");
 
+        std::string aligned_audio;
+        auto resampled = convertRawAudio(raw_audio, m_disable_audiofiles ? nullptr : &aligned_audio);
         bool notify_play = false;
-        if (!m_disable_audiofiles) {
-            const std::string file_path = saveDebugAudioFile(raw_audio);
+        if (!m_disable_audiofiles && !aligned_audio.empty()) {
+            const std::string file_path = saveDebugAudioFile(aligned_audio);
             if (!file_path.empty()) {
                 cJSON *json_file = cJSON_CreateString(file_path.c_str());
                 if (json_file) {
@@ -538,7 +547,6 @@ class AudioStreamer {
             free(serialized);
         }
 
-        auto resampled = convertRawAudio(raw_audio);
         if (resampled.empty()) {
             return SWITCH_FALSE;
         }
@@ -785,7 +793,7 @@ class AudioStreamer {
     std::atomic<bool> m_started{false};
     bool m_raw_audio_mode = false;
     private_t *m_context = nullptr;      // owner context; valid until the WebSocket thread has been joined
-    uint8_t m_pending_raw_byte = 0;      // raw mode: trailing odd byte carried to the next binary frame
+    uint8_t m_pending_raw_byte = 0;      // trailing odd PCM16 byte carried to the next playback message
     bool m_has_pending_raw_byte = false; // WebSocket thread only
 };
 
