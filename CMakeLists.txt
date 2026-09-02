@@ -37,13 +37,12 @@ endif()
 if(ENABLE_LOCAL)
     set(ENV{PKG_CONFIG_PATH} "/usr/local/freeswitch/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
 endif()
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 find_package(PkgConfig REQUIRED)
-find_package(SpeexDSP REQUIRED)
 find_package(Threads REQUIRED)
 
 pkg_check_modules(FreeSWITCH REQUIRED IMPORTED_TARGET freeswitch)
+pkg_check_modules(SpeexDSP REQUIRED IMPORTED_TARGET speexdsp)
 pkg_get_variable(FS_MOD_DIR freeswitch modulesdir)
 message(STATUS "FreeSWITCH modules dir: ${FS_MOD_DIR}")
 
@@ -76,12 +75,11 @@ target_compile_features(mod_openai_audio_stream PRIVATE c_std_99)
 
 target_include_directories(mod_openai_audio_stream PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/IXWebSocket
-    ${SPEEXDSP_INCLUDE_DIRS}
 )
 
 target_link_libraries(mod_openai_audio_stream PRIVATE
     PkgConfig::FreeSWITCH
-    ${SPEEXDSP_LIBRARIES}
+    PkgConfig::SpeexDSP
     ixwebsocket
     Threads::Threads
 )
