@@ -5,7 +5,6 @@ import base64
 import json
 import math
 import struct
-import time
 from http import HTTPStatus
 from pathlib import Path
 
@@ -264,7 +263,6 @@ class MockRealtimeServer:
         burst_count = 24
         response_id = "integration-underrun-response"
         samples_per_burst = int(sample_rate * burst_duration)
-        started_at = time.monotonic()
 
         for burst_index in range(burst_count):
             audio = pcm16_tone(
@@ -285,7 +283,6 @@ class MockRealtimeServer:
             burst_count=burst_count,
             burst_duration=burst_duration,
             burst_interval=burst_interval,
-            elapsed=time.monotonic() - started_at,
         )
 
     async def send_flow_control_response(self, websocket):

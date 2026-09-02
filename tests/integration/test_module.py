@@ -233,24 +233,32 @@ def wait_for_realtime_playback(duration_seconds):
     time.sleep(duration_seconds + PLAYBACK_DRAIN_MARGIN_SECONDS)
 
 
-def active_runs(samples, sample_rate, window_ms=5, threshold=500):
+def audio_activity_metrics(samples, sample_rate, window_ms=5, threshold=AUDIBLE_SAMPLE_THRESHOLD):
     window_size = max(sample_rate * window_ms // 1000, 1)
     runs = 0
     active = False
     active_windows = 0
+    first_active_offset = None
+    last_active_end = None
     for offset in range(0, len(samples) - window_size + 1, window_size):
         window = samples[offset : offset + window_size]
         mean_square = sum(sample * sample for sample in window) / len(window)
         window_active = mean_square >= threshold**2
         if window_active:
             active_windows += 1
+            if first_active_offset is None:
+                first_active_offset = offset
+            last_active_end = offset + window_size
             if not active:
                 runs += 1
         active = window_active
-    return runs, active_windows * window_size / sample_rate
+
+    active_duration = active_windows * window_size / sample_rate
+    active_span = 0.0 if first_active_offset is None else (last_active_end - first_active_offset) / sample_rate
+    return runs, active_duration, active_span
 
 
-def longest_silent_gap(samples, sample_rate, window_ms=20, threshold=500):
+def longest_silent_gap(samples, sample_rate, window_ms=20, threshold=AUDIBLE_SAMPLE_THRESHOLD):
     window_size = max(sample_rate * window_ms // 1000, 1)
     activity = []
     for offset in range(0, len(samples) - window_size + 1, window_size):
@@ -496,6 +504,8 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.stop_stream({"type": "integration.final", "marker": "stop-payload"})
 
     def assert_playback_control_creates_silence(self, command, inverse_command, scenario):
+        control_hold_seconds = 0.3
+        resumed_playback_seconds = 0.35
         with FreeSwitchEventSocket(self.uuid) as event_socket:
             self.start_stream(f"{MOCK_URL}/flow-control")
             self.start_recording(scenario)
@@ -507,16 +517,16 @@ class ModuleIntegrationTest(unittest.TestCase):
             )
 
             assert_ok(self, f"uuid_openai_audio_stream {self.uuid} {command}")
-            time.sleep(0.3)
+            time.sleep(control_hold_seconds)
             assert_ok(self, f"uuid_openai_audio_stream {self.uuid} {inverse_command}")
-            time.sleep(0.35)
+            time.sleep(resumed_playback_seconds)
             sample_rate, samples = self.stop_recording()
 
-        runs, _ = active_runs(samples, sample_rate, window_ms=20)
+        runs, _, _ = audio_activity_metrics(samples, sample_rate, window_ms=20)
         self.assertGreaterEqual(runs, 2, f"{command} did not interrupt audible playback")
         self.assertGreater(
             longest_silent_gap(samples, sample_rate),
-            0.15,
+            control_hold_seconds / 2,
             f"{command} did not create the expected silent playback interval",
         )
         self.assertAlmostEqual(dominant_frequency(samples, sample_rate), sent["frequency"], delta=75)
@@ -602,8 +612,9 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(mute_silence, "muting did not send one second of silence")
         self.assertTrue(mute_silence["all_zero"], "muting sent non-silent PCM data")
 
+        mute_observation_seconds = 0.25
         muted_since = len(mock_events())
-        time.sleep(0.25)
+        time.sleep(mute_observation_seconds)
         audio_while_muted = [
             event for event in mock_events()[muted_since:] if event.get("event") == "audio-received"
         ]
@@ -673,12 +684,17 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.stop_stream()
 
     def test_playback_audio_reaches_channel(self):
-        self.start_stream()
-        self.start_recording("playback")
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            self.start_stream()
+            self.start_recording("playback")
 
-        sent = self.trigger_response("audio-response-sent")
-        wait_for_realtime_playback(sent["duration_seconds"])
-        self.stop_recording()
+            sent = self.trigger_response("audio-response-sent")
+            stopped = event_socket.wait_for(SPEECH_STOP_EVENT)
+            self.assertIsNotNone(
+                stopped,
+                f"playback did not stop after response.output_audio.done; observed {event_socket.seen_events}",
+            )
+            self.stop_recording()
 
         self.assert_recording_contains_tone(sent["frequency"], sent["duration_seconds"])
         self.stop_stream()
@@ -698,36 +714,57 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.stop_stream()
 
     def test_playback_recovers_from_repeated_underruns(self):
-        self.start_stream(f"{MOCK_URL}/underrun")
-        self.start_recording("underrun")
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            self.start_stream(f"{MOCK_URL}/underrun")
+            self.start_recording("underrun")
 
-        sent = self.trigger_response("underrun-response-sent", timeout=10)
-        time.sleep(0.2)
-        sample_rate, samples = self.stop_recording()
-        recording_duration = len(samples) / sample_rate
-        self.assertGreater(
-            recording_duration,
-            sent["elapsed"] + 0.1,
-            "short replacement frames compressed the recorded playback timeline",
-        )
+            sent = self.trigger_response("underrun-response-sent", timeout=10)
+            stopped = event_socket.wait_for(SPEECH_STOP_EVENT)
+            self.assertIsNotNone(
+                stopped,
+                f"playback did not stop after the underrun response; observed {event_socket.seen_events}",
+            )
+            sample_rate, samples = self.stop_recording()
 
         # Use analysis windows shorter than each 5 ms burst: otherwise a burst crossing a
         # window boundary can be counted as 10 ms and make the upper bound timing-dependent.
-        runs, active_time = active_runs(samples, sample_rate, window_ms=1)
+        runs, active_time, active_span = audio_activity_metrics(samples, sample_rate, window_ms=1)
         expected_active_time = sent["burst_count"] * sent["burst_duration"]
+        expected_active_span = (sent["burst_count"] - 1) * sent["burst_interval"] + sent["burst_duration"]
         self.assertGreaterEqual(runs, sent["burst_count"] - 4, "playback did not recover after repeated underruns")
+        self.assertGreater(
+            active_span,
+            expected_active_span - PLAYBACK_DURATION_TOLERANCE_SECONDS,
+            "short replacement frames compressed the playback timeline",
+        )
         self.assertGreater(active_time, expected_active_time * 0.6)
         self.assertLess(active_time, expected_active_time * 1.5, "playback repeated or stretched underrun audio")
         self.assertAlmostEqual(dominant_frequency(samples, sample_rate), sent["frequency"], delta=75)
         self.stop_stream()
 
     def test_barge_in_discards_buffered_audio(self):
-        self.start_stream(f"{MOCK_URL}/barge-in")
-        self.start_recording("barge-in")
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            self.start_stream(f"{MOCK_URL}/barge-in")
+            self.start_recording("barge-in")
 
-        sent = self.trigger_response("barge-in-response-sent")
-        time.sleep(0.9)
-        sample_rate, samples = self.stop_recording()
+            sent = self.trigger_response("barge-in-response-sent")
+            interrupted_stopped = event_socket.wait_for(SPEECH_STOP_EVENT)
+            self.assertIsNotNone(
+                interrupted_stopped,
+                f"barge-in did not stop buffered playback; observed {event_socket.seen_events}",
+            )
+            replacement_started = event_socket.wait_for(SPEECH_START_EVENT)
+            self.assertIsNotNone(
+                replacement_started,
+                f"replacement playback did not start; observed {event_socket.seen_events}",
+            )
+            replacement_stopped = event_socket.wait_for(SPEECH_STOP_EVENT)
+            self.assertIsNotNone(
+                replacement_stopped,
+                f"replacement playback did not stop; observed {event_socket.seen_events}",
+            )
+            sample_rate, samples = self.stop_recording()
+
         durations = tone_durations(
             samples,
             sample_rate,
@@ -781,25 +818,30 @@ class ModuleIntegrationTest(unittest.TestCase):
     def test_raw_audio_streams_binary_pcm_in_both_directions(self):
         stream_api = "uuid_raw_audio_stream"
         before = len(mock_events())
-        # setUp keeps debug WAVs disabled because the mock deliberately sends one frame per byte.
-        # Requesting the mock's 8 kHz rate isolates PCM16 stitching; JSON playback covers resampling.
-        self.start_stream(
-            f"{MOCK_URL}/raw-audio",
-            start_muted=False,
-            stream_api=stream_api,
-            playback_rate="8k",
-        )
-        caller_audio = wait_for_event(lambda event: event.get("event") == "binary", before)
-        self.assertIsNotNone(caller_audio, "raw mode did not send caller audio as a binary WebSocket frame")
-        self.assertGreater(caller_audio["size"], 0)
-        self.assertTrue(caller_audio["sample_aligned"], "raw caller audio ended with a partial PCM16 sample")
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            # setUp keeps debug WAVs disabled because the mock deliberately sends one frame per byte.
+            # Requesting the mock's 8 kHz rate isolates PCM16 stitching; JSON playback covers resampling.
+            self.start_stream(
+                f"{MOCK_URL}/raw-audio",
+                start_muted=False,
+                stream_api=stream_api,
+                playback_rate="8k",
+            )
+            caller_audio = wait_for_event(lambda event: event.get("event") == "binary", before)
+            self.assertIsNotNone(caller_audio, "raw mode did not send caller audio as a binary WebSocket frame")
+            self.assertGreater(caller_audio["size"], 0)
+            self.assertTrue(caller_audio["sample_aligned"], "raw caller audio ended with a partial PCM16 sample")
 
-        self.start_recording("raw-audio")
-        sent = self.trigger_response("raw-audio-response-sent", stream_api=stream_api)
-        self.assertGreater(sent["split_frame_count"], 1, "mock did not split the binary PCM stream")
-        time.sleep(1)
+            self.start_recording("raw-audio")
+            sent = self.trigger_response("raw-audio-response-sent", stream_api=stream_api)
+            self.assertGreater(sent["split_frame_count"], 1, "mock did not split the binary PCM stream")
+            stopped = event_socket.wait_for(SPEECH_STOP_EVENT)
+            self.assertIsNotNone(
+                stopped,
+                f"raw playback did not stop after response.output_audio.done; observed {event_socket.seen_events}",
+            )
+            sample_rate, samples = self.stop_recording()
 
-        sample_rate, samples = self.stop_recording()
         durations = tone_durations(
             samples,
             sample_rate,
@@ -826,7 +868,7 @@ class ModuleIntegrationTest(unittest.TestCase):
         )
         self.start_recording("raw-audio-boundary")
         sent = self.trigger_response("raw-audio-boundary-response-sent", stream_api=stream_api)
-        time.sleep(0.65)
+        wait_for_realtime_playback(sent["replacement_duration"])
         sample_rate, samples = self.stop_recording()
         self.assertGreater(audible_duration(samples, sample_rate), 0.35)
         self.assertAlmostEqual(
@@ -947,8 +989,9 @@ class ModuleIntegrationTest(unittest.TestCase):
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_BUFFER_SIZE 1000")
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT false")
 
+        capture_residue_accumulation_seconds = 0.2
         self.start_stream(f"{MOCK_URL}/close-on-command", start_muted=False)
-        time.sleep(0.2)
+        time.sleep(capture_residue_accumulation_seconds)
         assert_ok(self, f"uuid_openai_audio_stream {self.uuid} pause")
 
         before_close = len(mock_events())
