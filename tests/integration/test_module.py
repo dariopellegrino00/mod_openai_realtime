@@ -26,6 +26,8 @@ MODULE_LOG_SOURCES = ("mod_openai_audio_stream.c:", "openai_audio_streamer_glue.
 MEDIA_BUG_NAME = "audio_stream"  # Keep in sync with MY_BUG_NAME in mod_openai_audio_stream.h.
 SPEECH_START_EVENT = "mod_openai_audio_stream::openai_speech_start"
 SPEECH_STOP_EVENT = "mod_openai_audio_stream::openai_speech_stop"
+JSON_EVENT = "mod_openai_audio_stream::json"
+CONNECTION_ERROR_EVENT = "mod_openai_audio_stream::error"
 
 
 class FreeSwitchEventSocket:
@@ -41,7 +43,9 @@ class FreeSwitchEventSocket:
             if headers.get("content-type") != "auth/request":
                 raise RuntimeError(f"unexpected FreeSWITCH event socket greeting: {headers}")
             self._command("auth ClueCon")
-            self._command(f"event json CUSTOM {SPEECH_START_EVENT} {SPEECH_STOP_EVENT}")
+            self._command(
+                f"event json CUSTOM {SPEECH_START_EVENT} {SPEECH_STOP_EVENT} {JSON_EVENT} {CONNECTION_ERROR_EVENT}"
+            )
         except Exception:
             self.close()
             raise
@@ -98,7 +102,7 @@ class FreeSwitchEventSocket:
         if headers.get("content-type") != "command/reply" or not headers.get("reply-text", "").startswith("+OK"):
             raise RuntimeError(f"FreeSWITCH event socket command failed: {command}: {headers}")
 
-    def wait_for(self, event_subclass, timeout=5):
+    def wait_for(self, event_subclass, timeout=5, predicate=None):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
@@ -110,7 +114,11 @@ class FreeSwitchEventSocket:
                 continue
             event = json.loads(body)
             self.seen_events.append((event.get("Unique-ID"), event.get("Event-Subclass")))
-            if event.get("Unique-ID") == self._unique_id and event.get("Event-Subclass") == event_subclass:
+            if (
+                event.get("Unique-ID") == self._unique_id
+                and event.get("Event-Subclass") == event_subclass
+                and (predicate is None or predicate(event))
+            ):
                 return event
         return None
 
@@ -382,18 +390,14 @@ class ModuleIntegrationTest(unittest.TestCase):
             "audible pre-reconnect capture reached the new connection",
         )
 
-    def module_error_lines(self):
+    def module_log_lines(self):
         with FREESWITCH_LOG.open("rb") as log:
             log.seek(self.freeswitch_log_start)
             lines = log.read().decode("utf-8", errors="replace").splitlines()
-        return [
-            line
-            for line in lines
-            if "[ERR]" in line and any(source in line for source in MODULE_LOG_SOURCES)
-        ]
+        return [line for line in lines if any(source in line for source in MODULE_LOG_SOURCES)]
 
     def assert_expected_module_errors(self):
-        unmatched = self.module_error_lines()
+        unmatched = [line for line in self.module_log_lines() if "[ERR]" in line]
         for fragment in self.expected_module_error_fragments:
             match = next((index for index, line in enumerate(unmatched) if fragment in line), None)
             if match is None:
@@ -479,6 +483,25 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(event, f"mock did not emit {expected_event}")
         return event
 
+    def trigger_connection_error(self, event_socket):
+        assert_ok(
+            self,
+            f"uuid_openai_audio_stream {self.uuid} start ws://127.0.0.1:1 mono 24k mute_user",
+        )
+        error_event = event_socket.wait_for(CONNECTION_ERROR_EVENT)
+        self.assertIsNotNone(error_event, "module did not emit connection-error details")
+
+        payload = json.loads(error_event.get("_body", ""))
+        self.assertEqual(payload.get("status"), "error")
+        message = payload.get("message")
+        self.assertIsInstance(message, dict)
+        self.assertIsInstance(message["error"], str)
+        self.assertTrue(message["error"], "connection-error reason is empty")
+        self.assertIsInstance(message["http_status"], int)
+        self.assertIsInstance(message["retries"], int)
+        self.assertIsInstance(message["wait_time"], (int, float))
+        return message
+
     def assert_recording_contains_tone(self, expected_frequency, expected_duration_seconds):
         self.assertTrue(
             self.recording.exists(),
@@ -502,6 +525,41 @@ class ModuleIntegrationTest(unittest.TestCase):
     def test_final_stop_payload(self):
         self.start_stream()
         self.stop_stream({"type": "integration.final", "marker": "stop-payload"})
+
+    def test_suppress_log_snapshot_hides_payloads_without_suppressing_events(self):
+        marker = f"suppressed-payload-{self.uuid}"
+        final_payload = {"type": "integration.final", "marker": marker}
+        encoded_final_payload = encode_json(final_payload)
+        self.expect_module_errors(
+            "WebSocket error response received (payload suppressed)",
+            "invalid JSON (details suppressed)",
+            "invalid websocket uri (details suppressed)",
+            "start requires a websocket URI and mix type (arguments suppressed)",
+        )
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_SUPPRESS_LOG true")
+
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            self.start_stream(f"{MOCK_URL}/suppress-log?credential={marker}")
+            assert_ok(self, f"uuid_setvar {self.uuid} STREAM_SUPPRESS_LOG false")
+            self.trigger_response(
+                "error-response-sent",
+                {"type": "response.create", "metadata": {"marker": marker}},
+            )
+            response_event = event_socket.wait_for(
+                JSON_EVENT,
+                predicate=lambda event: marker in event.get("_body", ""),
+            )
+            self.assertIsNotNone(response_event, "suppressed WebSocket response event was not emitted")
+
+            invalid_json = base64.b64encode(f'{{"marker":"{marker}"'.encode()).decode()
+            assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {invalid_json}")
+            assert_error(self, f"uuid_openai_audio_stream {self.uuid} start http://{marker}.example mono 24k")
+            assert_error(self, f"uuid_openai_audio_stream {self.uuid} start wss://example.test?credential={marker}")
+
+        self.stop_stream(final_payload)
+        module_log = "\n".join(self.module_log_lines())
+        self.assertNotIn(marker, module_log, "suppressed response or URI payload leaked into the module log")
+        self.assertNotIn(encoded_final_payload, module_log, "suppressed final payload leaked into the module log")
 
     def assert_playback_control_creates_silence(self, command, inverse_command, scenario):
         control_hold_seconds = 0.3
@@ -1128,6 +1186,36 @@ class ModuleIntegrationTest(unittest.TestCase):
 
         self.restart_after_automatic_cleanup()
         self.stop_stream()
+
+    def test_connection_error_logs_diagnostics(self):
+        self.expect_module_errors("WebSocket connection error:")
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            message = self.trigger_connection_error(event_socket)
+
+        matching_logs = [
+            line for line in self.module_log_lines() if "WebSocket connection error:" in line
+        ]
+        self.assertEqual(len(matching_logs), 1, f"unexpected connection-error logs: {matching_logs}")
+        diagnostic = matching_logs[0]
+        self.assertIn(message["error"], diagnostic)
+        self.assertIn(f"HTTP status {message['http_status']}", diagnostic)
+        self.assertIn(f"retries {message['retries']}", diagnostic)
+        self.assertIn(f"retry wait {message['wait_time']:g} ms", diagnostic)
+
+    def test_connection_error_respects_log_suppression(self):
+        self.expect_module_errors("WebSocket connection error (details suppressed)")
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_SUPPRESS_LOG true")
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            message = self.trigger_connection_error(event_socket)
+
+        matching_logs = [
+            line for line in self.module_log_lines() if "WebSocket connection error" in line
+        ]
+        self.assertEqual(len(matching_logs), 1, f"unexpected connection-error logs: {matching_logs}")
+        diagnostic = matching_logs[0]
+        self.assertIn("details suppressed", diagnostic)
+        self.assertNotIn(message["error"], diagnostic)
+        self.assertNotIn("HTTP status", diagnostic)
 
     def test_peer_close_while_paused_cleans_up_without_resume(self):
         before = len(mock_events())

@@ -107,7 +107,7 @@ The following channel variables configure the WebSocket connection and module lo
 | -------------------------------------- | ------------------------------------------------------- | ------- |
 | STREAM_MESSAGE_DEFLATE                 | true or 1, disables per message deflate                 | off     |
 | STREAM_HEART_BEAT                      | number of seconds (1 to 3600), interval to send the heart beat | off     |
-| STREAM_SUPPRESS_LOG                    | true or 1, suppresses printing to log                   | off     |
+| STREAM_SUPPRESS_LOG                    | true or 1, suppresses WebSocket payloads, URI details and final JSON in module logs; captured when the stream starts | off     |
 | STREAM_BUFFER_SIZE                     | buffer duration in milliseconds, divisible by 20, max 1000 | 20      |
 | STREAM_EXTRA_HEADERS                   | JSON object for additional headers in string format; merged with the Authorization header when STREAM_OPENAI_API_KEY is set (Authorization takes precedence) | none    |
 | STREAM_NO_RECONNECT                    | true or 1, disables automatic WebSocket reconnection; after a close, an active stream drains queued playback before stopping, while a paused stream stops immediately | off     |
@@ -121,7 +121,9 @@ The following channel variables configure the WebSocket connection and module lo
 
 - Per-message deflate is enabled by default; set `STREAM_MESSAGE_DEFLATE=true` to disable it.
 - `STREAM_HEART_BEAT` keeps otherwise idle connections active through intermediaries such as load balancers.
-- `STREAM_SUPPRESS_LOG=true` suppresses WebSocket response payloads in logs without suppressing events.
+- `STREAM_SUPPRESS_LOG=true` suppresses WebSocket payloads, URI details and final JSON in module logs without
+  suppressing events. An active stream keeps the value captured when it started; changing the channel variable takes
+  effect on the next stream.
 - `STREAM_BUFFER_SIZE` is the duration of each caller-audio chunk sent to the backend. It defaults to the 20 ms FreeSWITCH frame duration.
 - Authenticate official OpenAI endpoints with `STREAM_OPENAI_API_KEY` or an `Authorization` header in
   `STREAM_EXTRA_HEADERS`. Compatible backends may use their own headers or require no authentication.
@@ -365,7 +367,10 @@ A WebSocket connection attempt failed. The event contains the transport diagnost
 	}
 }
 ```
-- retries: `<int>`, error: `<string>`, wait_time: `<int>`, http_status: `<int>`
+- retries: `<int>`, error: `<string>`, wait_time: `<number, milliseconds>`, http_status: `<int>`
+
+Connection failures log these diagnostics by default. With `STREAM_SUPPRESS_LOG=true`, details remain available in
+the event body but are omitted from the module log because an error reason can contain the connection URI.
 
 ### play
 

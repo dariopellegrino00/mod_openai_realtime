@@ -130,6 +130,8 @@ class MockRealtimeServer:
                 elif message_type == "response.create":
                     if path == "/underrun":
                         await self.send_underrun_response(websocket)
+                    elif path.startswith("/suppress-log"):
+                        await self.send_error_response(websocket, payload)
                     elif path == "/invalid-delta-after-done":
                         await self.send_invalid_delta_after_done_response(websocket)
                     elif path == "/barge-in":
@@ -191,6 +193,11 @@ class MockRealtimeServer:
             frequency=frequency,
             duration_seconds=duration_seconds,
         )
+
+    async def send_error_response(self, websocket, request):
+        marker = request.get("metadata", {}).get("marker", "missing-marker")
+        await websocket.send(json.dumps({"type": "error", "error": {"message": marker}}))
+        await self.record("error-response-sent", marker=marker)
 
     async def send_invalid_delta_after_done_response(self, websocket):
         sample_rate = 24000

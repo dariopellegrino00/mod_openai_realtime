@@ -30,6 +30,7 @@ struct private_data {
     void *cpp_context;
     uint32_t sampling;
     int channels;
+    switch_bool_t suppress_log;
     switch_atomic_t audio_paused;
     switch_atomic_t user_audio_muted;
     switch_atomic_t openai_audio_muted;

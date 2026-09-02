@@ -57,7 +57,9 @@ that PCM carry is reset after a discarded oversized binary frame.
 Capture tests verify configured packet aggregation, mono/stereo channel separation, user mute/unmute semantics, and
 WebSocket header precedence. Reconnection tests hold the handshake while the capture source changes, proving that
 audio buffered before a dropped or initially failed connection cannot reach the next connection. The suite also
-rejects malformed or sample-misaligned data observed by the mock.
+checks actionable connection-error diagnostics and payload suppression in logs without event suppression.
+Suppression is verified as a per-stream setting captured at start, including for transport connection errors.
+Malformed or sample-misaligned data observed by the mock is rejected.
 
 ```sh
 ./tests/run-integration.sh

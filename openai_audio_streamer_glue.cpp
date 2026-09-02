@@ -228,13 +228,23 @@ class AudioStreamer {
     }
 
     void handleConnectionError(const ix::WebSocketErrorInfo& error) {
+        const char *reason = error.reason.empty() ? "unknown error" : error.reason.c_str();
+        if (m_suppress_log) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                              "(%s) WebSocket connection error (details suppressed)\n", m_sessionId.c_str());
+        } else {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                              "(%s) WebSocket connection error: %s (HTTP status %d, retries %u, retry wait %g ms)\n",
+                              m_sessionId.c_str(), reason, error.http_status, error.retries, error.wait_time);
+        }
+
         cJSON *root = cJSON_CreateObject();
         if (root) {
             cJSON_AddStringToObject(root, "status", "error");
             cJSON *message = cJSON_CreateObject();
             if (message) {
                 cJSON_AddNumberToObject(message, "retries", error.retries);
-                cJSON_AddStringToObject(message, "error", error.reason.c_str());
+                cJSON_AddStringToObject(message, "error", reason);
                 cJSON_AddNumberToObject(message, "wait_time", error.wait_time);
                 cJSON_AddNumberToObject(message, "http_status", error.http_status);
                 cJSON_AddItemToObject(root, "message", message);
@@ -298,7 +308,6 @@ class AudioStreamer {
                     m_notify(psession, EVENT_DISCONNECT, message);
                     break;
                 case CONNECT_ERROR:
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO, "connection error\n");
                     m_notify(psession, EVENT_ERROR, message);
                     break;
                 case MESSAGE: {
@@ -577,8 +586,14 @@ class AudioStreamer {
 
         switch (stream_protocol::classify_json_message(json_type)) {
             case stream_protocol::JsonMessageType::Error:
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                  "(%s) processMessage - error: %s\n", m_sessionId.c_str(), message.c_str());
+                if (m_suppress_log) {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                      "(%s) WebSocket error response received (payload suppressed)\n",
+                                      m_sessionId.c_str());
+                } else {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                      "(%s) WebSocket error response: %s\n", m_sessionId.c_str(), message.c_str());
+                }
                 break;
             case stream_protocol::JsonMessageType::SpeechStarted:
                 handleSpeechStarted(session);
@@ -911,6 +926,7 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
     tech_pvt->sampling = config.capture_output_rate;
     tech_pvt->rtp_packets = config.capture_packet_count;
     tech_pvt->channels = config.channels;
+    tech_pvt->suppress_log = config.suppress_log ? SWITCH_TRUE : SWITCH_FALSE;
     switch_atomic_set(&tech_pvt->audio_paused, 0);
     switch_atomic_set(&tech_pvt->user_audio_muted, config.start_muted ? 1 : 0);
     switch_atomic_set(&tech_pvt->openai_audio_muted, 0);
@@ -1135,9 +1151,14 @@ switch_status_t stream_session_send_json(switch_core_session_t *session, const c
 
     json_obj = cJSON_Parse(decoded_str.c_str());
     if (!json_obj) {
-        const char *err = cJSON_GetErrorPtr();
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                          "stream_session_send_json failed: invalid JSON. Error near: %s\n", err ? err : "unknown");
+        if (streamer->suppress_log()) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "stream_session_send_json failed: invalid JSON (details suppressed).\n");
+        } else {
+            const char *err = cJSON_GetErrorPtr();
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "stream_session_send_json failed: invalid JSON. Error near: %s\n", err ? err : "unknown");
+        }
         return SWITCH_STATUS_FALSE;
     }
 
