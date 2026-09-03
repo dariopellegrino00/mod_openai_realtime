@@ -730,23 +730,29 @@ class ModuleIntegrationTest(unittest.TestCase):
     def test_stereo_capture_preserves_channel_separation(self):
         self.start_read_tone()
         path = "/stereo-capture"
-        before = len(mock_events())
-        self.start_stream(f"{MOCK_URL}{path}", start_muted=False, mix_type="stereo")
-        captured = wait_for_event(
-            lambda event: event.get("event") == "audio-received"
-            and event.get("path") == path
-            and len(event.get("channel_peak_amplitudes", [])) == 2,
-            before,
-        )
-        self.assertIsNotNone(captured, "module did not send interleaved stereo capture")
-        caller_peak, callee_peak = captured["channel_peak_amplitudes"]
-        self.assertGreaterEqual(
-            caller_peak,
-            AUDIBLE_SAMPLE_THRESHOLD,
-            "caller channel did not contain the test tone",
-        )
-        self.assertLess(callee_peak, AUDIBLE_SAMPLE_THRESHOLD, "caller tone leaked into the callee channel")
-        self.stop_stream()
+        for sample_rate in (8000, 24000):
+            with self.subTest(sample_rate=sample_rate):
+                before = len(mock_events())
+                self.start_stream(
+                    f"{MOCK_URL}{path}", start_muted=False, mix_type="stereo", send_rate=f"{sample_rate // 1000}k"
+                )
+                captured = wait_for_event(
+                    lambda event: event.get("event") == "audio-received"
+                    and event.get("path") == path
+                    and len(event.get("channel_peak_amplitudes", [])) == 2,
+                    before,
+                )
+                self.stop_stream()
+                self.assertIsNotNone(captured, "module did not send interleaved stereo capture")
+                expected_frame_bytes = sample_rate * 20 // 1000 * 2 * PCM16_BYTES_PER_SAMPLE
+                self.assertEqual(captured["size"], expected_frame_bytes, "incomplete 20 ms stereo capture frame")
+                caller_peak, callee_peak = captured["channel_peak_amplitudes"]
+                self.assertGreaterEqual(
+                    caller_peak,
+                    AUDIBLE_SAMPLE_THRESHOLD,
+                    "caller channel did not contain the test tone",
+                )
+                self.assertLess(callee_peak, AUDIBLE_SAMPLE_THRESHOLD, "caller tone leaked into the callee channel")
 
     def test_invalid_capture_buffer_size_uses_default(self):
         default_frame_bytes = 24000 * 20 // 1000 * PCM16_BYTES_PER_SAMPLE

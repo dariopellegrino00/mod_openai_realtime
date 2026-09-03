@@ -37,6 +37,7 @@ constexpr std::size_t MAX_PLAYBACK_QUEUE_SECONDS = 180;
 constexpr int MAX_JSON_DEPTH = 128;
 constexpr int MAX_STREAM_BUFFER_MS = 1000;
 constexpr int MAX_HEARTBEAT_SECONDS = 3600;
+constexpr std::size_t MEDIA_BUG_STEREO_BUFFER_BYTES = SWITCH_RECOMMENDED_BUFFER_SIZE * 2U;
 // Overload guard: peer messages beyond this are dropped before copying/parsing.
 constexpr std::size_t MAX_WS_MESSAGE_BYTES = std::size_t{8} * 1024U * 1024U;
 constexpr std::size_t PLAYBACK_BUFFER_BYTES = 128000;
@@ -75,7 +76,8 @@ struct StreamBuffers {
     StreamBuffers() {
         flush_buffer.reserve(SWITCH_RECOMMENDED_BUFFER_SIZE);
         resample_buffer.reserve(SWITCH_RECOMMENDED_BUFFER_SIZE / sizeof(spx_int16_t));
-        data_buf.resize(SWITCH_RECOMMENDED_BUFFER_SIZE);
+        // switch_core_media_bug_read checks buflen before doubling output for SMBF_STEREO.
+        data_buf.resize(MEDIA_BUG_STEREO_BUFFER_BYTES);
     }
 };
 
