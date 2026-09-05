@@ -28,8 +28,7 @@ static switch_bool_t suppress_sensitive_logs(switch_core_session_t *session) {
     }
 
     switch_channel_t *channel = switch_core_session_get_channel(session);
-    switch_media_bug_t *bug = channel ? switch_channel_get_private(channel, MY_BUG_NAME) : NULL;
-    private_t *tech_pvt = bug ? (private_t *)switch_core_media_bug_get_user_data(bug) : NULL;
+    private_t *tech_pvt = channel ? switch_channel_get_private(channel, MY_BUG_NAME) : NULL;
 
     if (tech_pvt) {
         return tech_pvt->suppress_log;
@@ -62,7 +61,7 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
             break;
 
         case SWITCH_ABC_TYPE_CLOSE:
-            stream_session_cleanup(session, NULL, 1);
+            stream_session_close(session, user_data);
             break;
 
         case SWITCH_ABC_TYPE_READ:
@@ -149,17 +148,24 @@ static switch_status_t start_capture(switch_core_session_t *session, switch_medi
                           "Error initializing mod_openai_audio_stream session.\n");
         return SWITCH_STATUS_FALSE;
     }
+    private_t *tech_pvt = (private_t *)pUserData;
+    /* CLOSE may run as soon as add publishes the bug. Keep its context alive until startup completes. */
+    switch_mutex_lock(tech_pvt->mutex);
     if ((status = switch_core_media_bug_add(session, MY_BUG_NAME, NULL, capture_callback, pUserData, 0, flags, &bug)) !=
         SWITCH_STATUS_SUCCESS) {
+        switch_mutex_unlock(tech_pvt->mutex);
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error adding media bug.\n");
         stream_session_release(pUserData);
         return status;
     }
-    switch_channel_set_private(channel, MY_BUG_NAME, bug);
+    tech_pvt->bug = bug;
+    switch_channel_set_private(channel, MY_BUG_NAME, tech_pvt);
 
-    if (stream_session_start(pUserData) != SWITCH_STATUS_SUCCESS) {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error starting WebSocket thread.\n");
-        stream_session_cleanup(session, NULL, 0);
+    status = switch_channel_ready(channel) ? stream_session_start(pUserData) : SWITCH_STATUS_FALSE;
+    switch_mutex_unlock(tech_pvt->mutex);
+    if (status != SWITCH_STATUS_SUCCESS) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error starting stream.\n");
+        stream_session_cleanup(session, NULL);
         return SWITCH_STATUS_FALSE;
     }
 
@@ -178,7 +184,7 @@ static switch_status_t do_stop(switch_core_session_t *session, char *json) {
     } else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_openai_audio_stream: stop\n");
     }
-    return stream_session_cleanup(session, json, 0);
+    return stream_session_cleanup(session, json);
 }
 
 static switch_status_t do_pauseresume(switch_core_session_t *session, int pause) {
@@ -216,9 +222,7 @@ static switch_status_t do_audio_mute(switch_core_session_t *session, const char 
 static switch_status_t send_json(switch_core_session_t *session, char *json) {
     switch_status_t status = SWITCH_STATUS_FALSE;
     switch_channel_t *channel = switch_core_session_get_channel(session);
-    switch_media_bug_t *bug = switch_channel_get_private(channel, MY_BUG_NAME);
-
-    if (bug) {
+    if (switch_channel_get_private(channel, MY_BUG_NAME)) {
         status = stream_session_send_json(session, json);
     } else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,

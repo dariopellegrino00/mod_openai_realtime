@@ -10,6 +10,7 @@ import time
 import unittest
 import wave
 from array import array
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -522,9 +523,72 @@ class ModuleIntegrationTest(unittest.TestCase):
         frequency = dominant_frequency(samples, sample_rate)
         self.assertAlmostEqual(frequency, expected_frequency, delta=75)
 
+    @contextmanager
+    def hold_stop_before_removal(self, command):
+        markers = {
+            name: Path(f"/tmp/mod-openai-lifecycle-{name}")
+            for name in ("arm", "remove-entered", "close-entered", "continue")
+        }
+        for marker in markers.values():
+            marker.unlink(missing_ok=True)
+            self.addCleanup(marker.unlink, missing_ok=True)
+        markers["arm"].touch()
+        stop = subprocess.Popen(
+            ["fs_cli", "-x", command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertTrue(wait_until(markers["remove-entered"].exists), "stop did not reach media-bug removal")
+            yield markers
+            markers["continue"].touch()
+            output, errors = stop.communicate(timeout=3)
+            self.assertEqual(stop.returncode, 0, errors)
+            self.assertTrue(output.startswith("+OK"), f"stop failed: {output}")
+        finally:
+            markers["continue"].touch()
+            if stop.poll() is None:
+                stop.kill()
+            stop.communicate()
+
     def test_final_stop_payload(self):
-        self.start_stream()
-        self.stop_stream({"type": "integration.final", "marker": "stop-payload"})
+        for buffer_ms in (20, 1000):
+            with self.subTest(buffer_ms=buffer_ms):
+                assert_ok(self, f"uuid_setvar {self.uuid} STREAM_BUFFER_SIZE {buffer_ms}")
+                before = len(mock_events())
+                self.start_stream(start_muted=False)
+                self.assertIsNotNone(
+                    wait_for_event(lambda event: event.get("event") == "audio-received", before),
+                    "capture was not active before stop",
+                )
+                # Leave a partial packet for the stop flush in the buffered case.
+                time.sleep(0.1)
+                before = len(mock_events())
+                payload = {"type": "integration.final", "marker": f"stop-payload-{buffer_ms}"}
+                command = f"uuid_openai_audio_stream {self.uuid} stop {encode_json(payload)}"
+                with self.hold_stop_before_removal(command):
+                    self.assertIsNotNone(
+                        wait_for_event(lambda event: event.get("payload") == payload, before),
+                        "stop did not send the final payload before removal",
+                    )
+                    # Allow media callbacks while stop has released the context mutex.
+                    time.sleep(0.25)
+                self.assertIsNotNone(
+                    wait_for_event(lambda event: event.get("event") == "disconnected", before),
+                    "WebSocket did not disconnect after stop",
+                )
+                events = mock_events()[before:]
+                final_index = next(i for i, event in enumerate(events) if event.get("payload") == payload)
+                self.assertFalse(
+                    any(event.get("event") == "audio-received" for event in events[final_index + 1:]),
+                    "capture audio followed the final stop payload",
+                )
+                if buffer_ms == 1000:
+                    self.assertTrue(
+                        any(event.get("event") == "audio-received" for event in events[:final_index]),
+                        "stop did not flush the capture residue before the final payload",
+                    )
 
     def test_suppress_log_snapshot_hides_payloads_without_suppressing_events(self):
         marker = f"suppressed-payload-{self.uuid}"
@@ -1064,6 +1128,19 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.uuid = None
         disconnected = wait_for_event(lambda event: event.get("event") == "disconnected", before)
         self.assertIsNotNone(disconnected, "WebSocket did not disconnect after channel hangup")
+
+    def test_stop_overlaps_hangup(self):
+        self.start_stream()
+        before = len(mock_events())
+        with self.hold_stop_before_removal(f"uuid_openai_audio_stream {self.uuid} stop") as markers:
+            assert_ok(self, f"uuid_kill {self.uuid}")
+            self.assertTrue(wait_until(markers["close-entered"].exists), "hangup did not enter CLOSE")
+        self.assertEqual(api(f"uuid_exists {self.uuid}"), "false")
+        self.uuid = None
+        self.assertIsNotNone(
+            wait_for_event(lambda event: event.get("event") == "disconnected", before),
+            "WebSocket survived the overlapping stop and hangup",
+        )
 
     def test_reconnects_after_transient_peer_failure(self):
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT false")

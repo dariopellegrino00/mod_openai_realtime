@@ -835,10 +835,6 @@ class StreamRuntime {
         return m_buffers;
     }
 
-    void finish() {
-        m_streamer.reset();
-    }
-
   private:
     // Members are destroyed in reverse order: the WebSocket-owning streamer stops before
     // the callback/media scratch buffers disappear.
@@ -855,7 +851,7 @@ AudioStreamer *audio_streamer(private_t *data) {
     return runtime ? runtime->streamer() : nullptr;
 }
 
-using LifecycleMutex = std::recursive_mutex;
+using LifecycleMutex = std::mutex;
 
 struct LifecycleLockHandle {
     std::string session_id;
@@ -909,20 +905,6 @@ void release_lifecycle_lock(LifecycleLockHandle *handle) noexcept {
     }
     delete handle;
 }
-
-class LifecycleLockScope {
-  public:
-    explicit LifecycleLockScope(switch_core_session_t *session) : m_handle(acquire_lifecycle_lock(session)) {}
-    ~LifecycleLockScope() {
-        release_lifecycle_lock(m_handle);
-    }
-    explicit operator bool() const {
-        return m_handle != nullptr;
-    }
-
-  private:
-    LifecycleLockHandle *m_handle;
-};
 
 switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *session, const StreamConfig& config) {
     int err = RESAMPLER_ERR_SUCCESS;
@@ -1000,17 +982,8 @@ void destroy_tech_pvt(private_t *tech_pvt) {
         speex_resampler_destroy(tech_pvt->resampler);
         tech_pvt->resampler = nullptr;
     }
-    if (tech_pvt->mutex) {
-        switch_mutex_destroy(tech_pvt->mutex);
-        tech_pvt->mutex = nullptr;
-    }
-}
-
-void finish(private_t *tech_pvt) {
-    StreamRuntime *runtime = stream_runtime(tech_pvt);
-    if (runtime) {
-        runtime->finish();
-    }
+    // The session pool owns the mutex: a command may have read this context just
+    // before CLOSE detached it and still be waiting to observe the closed state.
 }
 
 bool capture_is_paused_or_muted(private_t *tech_pvt) {
@@ -1067,9 +1040,20 @@ bool flush_capture_residue(private_t *tech_pvt) {
     return false;
 }
 
+// API operations keep the bug and streamer alive while CLOSE waits on the context mutex.
 struct SessionContext {
-    switch_media_bug_t *bug;
-    private_t *data;
+    SessionContext() = default;
+    SessionContext(const SessionContext&) = delete;
+    SessionContext& operator=(const SessionContext&) = delete;
+
+    switch_media_bug_t *bug = nullptr;
+    private_t *data = nullptr;
+
+    ~SessionContext() {
+        if (data) {
+            switch_mutex_unlock(data->mutex);
+        }
+    }
 };
 
 bool find_session_context(switch_core_session_t *session, const char *operation, SessionContext& context) {
@@ -1085,17 +1069,14 @@ bool find_session_context(switch_core_session_t *session, const char *operation,
         return false;
     }
 
-    context.bug = static_cast<switch_media_bug_t *>(switch_channel_get_private(channel, MY_BUG_NAME));
+    context.data = static_cast<private_t *>(switch_channel_get_private(channel, MY_BUG_NAME));
+    if (context.data) {
+        switch_mutex_lock(context.data->mutex);
+        context.bug = context.data->bug;
+    }
     if (!context.bug) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "%s failed: no media bug found.\n",
                           operation);
-        return false;
-    }
-
-    context.data = static_cast<private_t *>(switch_core_media_bug_get_user_data(context.bug));
-    if (!context.data) {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                          "%s failed: session data is unavailable.\n", operation);
         return false;
     }
     return true;
@@ -1192,11 +1173,6 @@ switch_status_t stream_session_pauseresume(switch_core_session_t *session, int p
 
     switch_core_media_bug_flush(context.bug);
     switch_atomic_set(&context.data->audio_paused, pause ? 1 : 0);
-    if (pause && context.data->mutex) {
-        // Wait for a capture callback that observed the old state to leave before acknowledging pause.
-        switch_mutex_lock(context.data->mutex);
-        switch_mutex_unlock(context.data->mutex);
-    }
     return SWITCH_STATUS_SUCCESS;
 }
 
@@ -1223,10 +1199,6 @@ switch_status_t stream_session_set_user_mute(switch_core_session_t *session, int
                       new_state ? "muted" : "unmuted");
 
     if (new_state) {
-        if (tech_pvt->mutex) {
-            switch_mutex_lock(tech_pvt->mutex);
-        }
-
         // Deliver the residual pre-mute speech before injecting silence, instead of dropping it
         flush_capture_residue(tech_pvt);
         if (!reset_capture_resampler(tech_pvt)) {
@@ -1248,10 +1220,6 @@ switch_status_t stream_session_set_user_mute(switch_core_session_t *session, int
             }
         } else {
             status = SWITCH_STATUS_FALSE;
-        }
-
-        if (tech_pvt->mutex) {
-            switch_mutex_unlock(tech_pvt->mutex);
         }
     }
 
@@ -1749,64 +1717,57 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
     return SWITCH_TRUE;
 }
 
-switch_status_t stream_session_cleanup(switch_core_session_t *session, char *text, int channelIsClosing) {
-    LifecycleLockScope lifecycle_lock(session);
-    if (!lifecycle_lock) {
-        return SWITCH_STATUS_FALSE;
-    }
-
+void stream_session_close(switch_core_session_t *session, void *user_data) {
+    auto *tech_pvt = static_cast<private_t *>(user_data);
     switch_channel_t *channel = switch_core_session_get_channel(session);
-    auto *bug = static_cast<switch_media_bug_t *>(switch_channel_get_private(channel, MY_BUG_NAME));
-    if (bug) {
-        auto *tech_pvt = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
-        switch_status_t status = SWITCH_STATUS_SUCCESS;
-        char sessionId[MAX_SESSION_ID];
 
-        if (!tech_pvt) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                              "stream_session_cleanup: media bug has no session data\n");
-            switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
-            if (!channelIsClosing && switch_core_media_bug_remove(session, &bug) != SWITCH_STATUS_SUCCESS) {
-                switch_channel_set_private(channel, MY_BUG_NAME, bug);
-            }
+    // FreeSWITCH can invoke CLOSE under bug_rwlock. Never acquire the API lifecycle
+    // lock here: start/stop hold it while entering FreeSWITCH's media-bug functions.
+    switch_mutex_lock(tech_pvt->mutex);
+    flush_capture_residue(tech_pvt);
+    if (switch_channel_get_private(channel, MY_BUG_NAME) == tech_pvt) {
+        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
+    }
+    tech_pvt->bug = nullptr;
+    destroy_tech_pvt(tech_pvt);
+    switch_mutex_unlock(tech_pvt->mutex);
+}
+
+switch_status_t stream_session_cleanup(switch_core_session_t *session, char *text) {
+    // The API lifecycle lock serializes stop with start. CLOSE instead uses the
+    // context mutex, which must be released before acquiring FreeSWITCH bug_rwlock.
+    private_t *tech_pvt;
+    switch_atomic_t was_paused;
+    switch_status_t status = SWITCH_STATUS_SUCCESS;
+    {
+        SessionContext context{};
+        if (!find_session_context(session, "stream_session_cleanup", context)) {
             return SWITCH_STATUS_FALSE;
         }
-
-        strncpy(sessionId, tech_pvt->sessionId, MAX_SESSION_ID - 1);
-        sessionId[MAX_SESSION_ID - 1] = '\0';
-
-        switch_mutex_lock(tech_pvt->mutex);
-
-        // Deliver the residual aggregated capture audio before the final JSON and the teardown,
-        // so a final commit/response request sees all the audio captured so far
+        tech_pvt = context.data;
+        // Keep capture stopped after releasing the mutex: no audio may follow the final JSON.
+        was_paused = switch_atomic_read(&tech_pvt->audio_paused);
+        switch_atomic_set(&tech_pvt->audio_paused, 1);
         flush_capture_residue(tech_pvt);
-
         if (text && *text) {
             status = stream_session_send_json(session, text);
         }
-
-        // Detach and remove the media bug while its user data is still alive. Once remove
-        // returns, no media callback can race the synchronous WebSocket teardown below.
-        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
-        if (!channelIsClosing && switch_core_media_bug_remove(session, &bug) != SWITCH_STATUS_SUCCESS) {
-            // FreeSWITCH may refuse removal while a bug is thread-locked. Keep the context alive
-            // and reachable so media callbacks cannot observe freed user data.
-            switch_channel_set_private(channel, MY_BUG_NAME, bug);
-            switch_mutex_unlock(tech_pvt->mutex);
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                              "(%s) stream_session_cleanup: failed to remove media bug\n", sessionId);
-            return SWITCH_STATUS_FALSE;
-        }
-
-        finish(tech_pvt);
-
-        switch_mutex_unlock(tech_pvt->mutex);
-        destroy_tech_pvt(tech_pvt);
-        return status;
     }
 
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-                      "stream_session_cleanup: no bug - websocket connection already closed\n");
-    return SWITCH_STATUS_FALSE;
+    // Removal by function avoids dereferencing a bug that a concurrent hangup may
+    // already have destroyed. API serialization prevents removing a new stream.
+    switch_core_media_bug_remove_all_function(session, MY_BUG_NAME);
+    switch_mutex_lock(tech_pvt->mutex);
+    const bool removed = tech_pvt->bug == nullptr;
+    if (!removed) {
+        switch_atomic_set(&tech_pvt->audio_paused, was_paused);
+    }
+    switch_mutex_unlock(tech_pvt->mutex);
+    if (!removed) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                          "stream_session_cleanup: failed to remove media bug\n");
+        return SWITCH_STATUS_FALSE;
+    }
+    return status;
 }
 }

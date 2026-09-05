@@ -44,6 +44,7 @@ esac
 
 cmake -S "${project_dir}/tests" -B "${build_dir}" \
     -DCMAKE_BUILD_TYPE=Debug \
+    -DBUILD_INTEGRATION_TESTS=OFF \
     "-DENABLE_TEST_SANITIZERS=${sanitizers}"
 cmake --build "${build_dir}" --parallel "${parallel_jobs}"
 (

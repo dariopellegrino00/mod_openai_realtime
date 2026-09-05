@@ -50,6 +50,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang++
           cmake -S tests -B build-tests \
             -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_INTEGRATION_TESTS=ON \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DCMAKE_CXX_COMPILER=clang++
 

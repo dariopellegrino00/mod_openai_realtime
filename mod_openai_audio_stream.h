@@ -23,6 +23,7 @@
 typedef void (*responseHandler_t)(switch_core_session_t *session, const char *eventName, const char *json);
 
 struct private_data {
+    switch_media_bug_t *bug; // Protected by mutex; NULL after CLOSE. Context lives in the session pool.
     switch_mutex_t *mutex;
     char sessionId[MAX_SESSION_ID];
     SpeexResamplerState *resampler;

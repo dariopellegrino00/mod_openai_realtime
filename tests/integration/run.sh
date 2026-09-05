@@ -16,6 +16,7 @@ if [ -n "${artifact_dir}" ]; then
 fi
 
 start_freeswitch() {
+    : "${LIFECYCLE_PROBE_PATH:?run through tests/run-ci.sh to build the lifecycle probe}"
     if [ "${ENABLE_INTEGRATION_SANITIZERS:-0}" = "1" ]; then
         asan_runtime=$(gcc -print-file-name=libasan.so)
         if [ ! -f "${asan_runtime}" ]; then
@@ -23,12 +24,12 @@ start_freeswitch() {
             return 1
         fi
 
-        LD_PRELOAD="${asan_runtime}" \
+        LD_PRELOAD="${asan_runtime}:${LIFECYCLE_PROBE_PATH}" \
             ASAN_OPTIONS="detect_leaks=0:halt_on_error=1" \
             UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
             freeswitch -nonat -ncwait >"${freeswitch_log}" 2>&1
     else
-        freeswitch -nonat -ncwait >"${freeswitch_log}" 2>&1
+        LD_PRELOAD="${LIFECYCLE_PROBE_PATH}" freeswitch -nonat -ncwait >"${freeswitch_log}" 2>&1
     fi
 }
 

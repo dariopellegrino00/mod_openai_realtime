@@ -14,6 +14,9 @@ esac
 export CMAKE_BUILD_PARALLEL_LEVEL="${parallel_jobs}"
 
 BUILD_DIR="${build_root}/unit-sanitized" "${project_dir}/tests/run-unit.sh" --sanitizers
+cmake -S "${project_dir}/tests" -B "${build_root}/unit-sanitized" -DBUILD_INTEGRATION_TESTS=ON
+cmake --build "${build_root}/unit-sanitized" --target lifecycle_probe --parallel "${parallel_jobs}"
+export LIFECYCLE_PROBE_PATH="${build_root}/unit-sanitized/liblifecycle_probe.so"
 
 cmake -S "${project_dir}" -B "${build_root}/module" \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \

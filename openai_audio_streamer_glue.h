@@ -30,7 +30,8 @@ void *stream_session_lifecycle_lock(switch_core_session_t *session);
 void stream_session_lifecycle_unlock(void *handle);
 switch_bool_t stream_frame(switch_media_bug_t *bug);
 switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bug);
-switch_status_t stream_session_cleanup(switch_core_session_t *session, char *text, int channelIsClosing);
+switch_status_t stream_session_cleanup(switch_core_session_t *session, char *text);
+void stream_session_close(switch_core_session_t *session, void *user_data);
 
 #ifdef __cplusplus
 }
