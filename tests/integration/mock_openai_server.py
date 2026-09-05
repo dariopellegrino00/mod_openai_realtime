@@ -341,20 +341,20 @@ class MockRealtimeServer:
 
     async def send_flow_control_response(self, websocket):
         sample_rate = 24000
-        frequency = 900
-        duration = 2.0
+        frequencies = [700, 1100, 1500]
+        segment_duration = 0.5
         response_id = "integration-flow-control-response"
         await self.send_audio_delta(
             websocket,
             response_id,
-            pcm16_tone(sample_rate, frequency, duration),
+            b"".join(pcm16_tone(sample_rate, frequency, segment_duration) for frequency in frequencies),
         )
         await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
         await self.record(
             "flow-control-response-sent",
             response_id=response_id,
-            frequency=frequency,
-            duration=duration,
+            frequencies=frequencies,
+            segment_duration=segment_duration,
         )
 
     async def send_barge_in_response(self, websocket):

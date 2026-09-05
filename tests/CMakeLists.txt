@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.18)
 project(mod_openai_audio_stream_tests LANGUAGES C CXX)
 
 find_package(Threads REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,6 +10,11 @@ set(MODULE_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/..")
 
 enable_testing()
 add_subdirectory(unit)
+add_test(NAME esl COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p "test_*.py")
+set_tests_properties(esl PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration"
+    TIMEOUT 10)
 
 option(BUILD_INTEGRATION_TESTS "Build the FreeSWITCH lifecycle test probe" OFF)
 if(BUILD_INTEGRATION_TESTS)

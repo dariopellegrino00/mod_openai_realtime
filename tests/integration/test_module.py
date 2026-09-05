@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
 import base64
 import json
-import math
 import os
-import socket
 import subprocess
-import sys
 import time
 import unittest
 import wave
-from array import array
 from contextlib import contextmanager
 from pathlib import Path
+
+from audio import (
+    AUDIBLE_SAMPLE_THRESHOLD,
+    PCM16_BYTES_PER_SAMPLE,
+    audible_duration,
+    audio_activity_metrics,
+    dominant_frequency,
+    longest_silent_gap,
+    read_mono_pcm16,
+    tone_durations,
+    tone_runs,
+)
+from esl import (
+    CONNECTION_ERROR_EVENT,
+    JSON_EVENT,
+    SPEECH_START_EVENT,
+    SPEECH_STOP_EVENT,
+    FreeSwitchEventSocket,
+)
 
 
 MOCK_URL = "ws://127.0.0.1:18080"
@@ -21,109 +36,8 @@ PLAYBACK_DRAIN_MARGIN_SECONDS = 0.4
 PLAYBACK_DURATION_TOLERANCE_SECONDS = 0.1
 FREESWITCH_LOG = Path(os.environ.get("FREESWITCH_RUNTIME_LOG", "/tmp/mod-openai-freeswitch.log"))
 ARTIFACT_DIR = Path(os.environ["TEST_ARTIFACT_DIR"]) if os.environ.get("TEST_ARTIFACT_DIR") else None
-PCM16_BYTES_PER_SAMPLE = 2
-AUDIBLE_SAMPLE_THRESHOLD = 500
 MODULE_LOG_SOURCES = ("mod_openai_audio_stream.c:", "openai_audio_streamer_glue.cpp:")
 MEDIA_BUG_NAME = "audio_stream"  # Keep in sync with MY_BUG_NAME in mod_openai_audio_stream.h.
-SPEECH_START_EVENT = "mod_openai_audio_stream::openai_speech_start"
-SPEECH_STOP_EVENT = "mod_openai_audio_stream::openai_speech_stop"
-JSON_EVENT = "mod_openai_audio_stream::json"
-CONNECTION_ERROR_EVENT = "mod_openai_audio_stream::error"
-
-
-class FreeSwitchEventSocket:
-    """Minimal inbound ESL client used to observe the module's public custom events."""
-
-    def __init__(self, unique_id):
-        self._unique_id = unique_id
-        self.seen_events = []
-        self._socket = socket.create_connection(("127.0.0.1", 8021), timeout=5)
-        self._buffer = bytearray()
-        try:
-            headers, _ = self._receive_packet(5)
-            if headers.get("content-type") != "auth/request":
-                raise RuntimeError(f"unexpected FreeSWITCH event socket greeting: {headers}")
-            self._command("auth ClueCon")
-            self._command(
-                f"event json CUSTOM {SPEECH_START_EVENT} {SPEECH_STOP_EVENT} {JSON_EVENT} {CONNECTION_ERROR_EVENT}"
-            )
-        except Exception:
-            self.close()
-            raise
-
-    def close(self):
-        self._socket.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, _exc_type, _exc_value, _traceback):
-        self.close()
-
-    def _header_boundary(self):
-        boundaries = []
-        for marker in (b"\r\n\r\n", b"\n\n"):
-            index = self._buffer.find(marker)
-            if index >= 0:
-                boundaries.append((index, len(marker)))
-        return min(boundaries) if boundaries else None
-
-    def _receive_packet(self, timeout):
-        self._socket.settimeout(timeout)
-        boundary = self._header_boundary()
-        while boundary is None:
-            chunk = self._socket.recv(4096)
-            if not chunk:
-                raise RuntimeError("FreeSWITCH event socket closed unexpectedly")
-            self._buffer.extend(chunk)
-            boundary = self._header_boundary()
-
-        header_end, marker_length = boundary
-        raw_headers = bytes(self._buffer[:header_end]).decode("utf-8", errors="replace")
-        del self._buffer[: header_end + marker_length]
-        headers = {}
-        for line in raw_headers.replace("\r\n", "\n").split("\n"):
-            if ":" in line:
-                name, value = line.split(":", 1)
-                headers[name.strip().lower()] = value.strip()
-
-        content_length = int(headers.get("content-length", "0"))
-        while len(self._buffer) < content_length:
-            chunk = self._socket.recv(4096)
-            if not chunk:
-                raise RuntimeError("FreeSWITCH event socket closed in a packet body")
-            self._buffer.extend(chunk)
-        body = bytes(self._buffer[:content_length])
-        del self._buffer[:content_length]
-        return headers, body
-
-    def _command(self, command):
-        self._socket.sendall(f"{command}\n\n".encode())
-        headers, _ = self._receive_packet(5)
-        if headers.get("content-type") != "command/reply" or not headers.get("reply-text", "").startswith("+OK"):
-            raise RuntimeError(f"FreeSWITCH event socket command failed: {command}: {headers}")
-
-    def wait_for(self, event_subclass, timeout=5, predicate=None):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            try:
-                headers, body = self._receive_packet(remaining)
-            except socket.timeout:
-                return None
-            if headers.get("content-type") != "text/event-json":
-                continue
-            event = json.loads(body)
-            self.seen_events.append((event.get("Unique-ID"), event.get("Event-Subclass")))
-            if (
-                event.get("Unique-ID") == self._unique_id
-                and event.get("Event-Subclass") == event_subclass
-                and (predicate is None or predicate(event))
-            ):
-                return event
-        return None
-
-
 def api(command, timeout=10):
     result = subprocess.run(
         ["fs_cli", "-x", command],
@@ -185,125 +99,9 @@ def encode_json(payload):
     return base64.b64encode(compact).decode()
 
 
-def read_mono_pcm16(path):
-    with wave.open(str(path), "rb") as recording:
-        channels = recording.getnchannels()
-        sample_width = recording.getsampwidth()
-        sample_rate = recording.getframerate()
-        frames = recording.readframes(recording.getnframes())
-
-    if sample_width != PCM16_BYTES_PER_SAMPLE:
-        raise AssertionError(f"expected PCM16 recording, got {sample_width * 8}-bit samples")
-
-    samples = array("h")
-    samples.frombytes(frames)
-    if sys.byteorder == "big":
-        samples.byteswap()
-    if channels > 1:
-        samples = array(
-            "h",
-            (
-                sum(samples[index : index + channels]) // channels
-                for index in range(0, len(samples), channels)
-            ),
-        )
-    return sample_rate, samples
-
-
-def goertzel_power(samples, sample_rate, frequency):
-    coefficient = 2 * math.cos(2 * math.pi * frequency / sample_rate)
-    previous = 0.0
-    previous_previous = 0.0
-    for sample in samples:
-        current = sample + coefficient * previous - previous_previous
-        previous_previous = previous
-        previous = current
-    return previous_previous**2 + previous**2 - coefficient * previous * previous_previous
-
-
-def dominant_frequency(samples, sample_rate):
-    frequencies = range(300, min(3000, sample_rate // 2), 25)
-    return max(frequencies, key=lambda frequency: goertzel_power(samples, sample_rate, frequency))
-
-
-def audible_duration(samples, sample_rate):
-    window_size = max(sample_rate // 50, 1)
-    active_samples = 0
-    for offset in range(0, len(samples) - window_size + 1, window_size):
-        window = samples[offset : offset + window_size]
-        mean_square = sum(sample * sample for sample in window) / len(window)
-        if mean_square >= AUDIBLE_SAMPLE_THRESHOLD**2:
-            active_samples += len(window)
-    return active_samples / sample_rate
-
-
 def wait_for_realtime_playback(duration_seconds):
     # The mock queues audio immediately, but FreeSWITCH consumes it at media rate.
     time.sleep(duration_seconds + PLAYBACK_DRAIN_MARGIN_SECONDS)
-
-
-def audio_activity_metrics(samples, sample_rate, window_ms=5, threshold=AUDIBLE_SAMPLE_THRESHOLD):
-    window_size = max(sample_rate * window_ms // 1000, 1)
-    runs = 0
-    active = False
-    active_windows = 0
-    first_active_offset = None
-    last_active_end = None
-    for offset in range(0, len(samples) - window_size + 1, window_size):
-        window = samples[offset : offset + window_size]
-        mean_square = sum(sample * sample for sample in window) / len(window)
-        window_active = mean_square >= threshold**2
-        if window_active:
-            active_windows += 1
-            if first_active_offset is None:
-                first_active_offset = offset
-            last_active_end = offset + window_size
-            if not active:
-                runs += 1
-        active = window_active
-
-    active_duration = active_windows * window_size / sample_rate
-    active_span = 0.0 if first_active_offset is None else (last_active_end - first_active_offset) / sample_rate
-    return runs, active_duration, active_span
-
-
-def longest_silent_gap(samples, sample_rate, window_ms=20, threshold=AUDIBLE_SAMPLE_THRESHOLD):
-    window_size = max(sample_rate * window_ms // 1000, 1)
-    activity = []
-    for offset in range(0, len(samples) - window_size + 1, window_size):
-        window = samples[offset : offset + window_size]
-        mean_square = sum(sample * sample for sample in window) / len(window)
-        activity.append(mean_square >= threshold**2)
-
-    try:
-        first_active = activity.index(True)
-        last_active = len(activity) - 1 - activity[::-1].index(True)
-    except ValueError:
-        return 0.0
-
-    longest = 0
-    current = 0
-    for active in activity[first_active : last_active + 1]:
-        if active:
-            longest = max(longest, current)
-            current = 0
-        else:
-            current += 1
-    return max(longest, current) * window_size / sample_rate
-
-
-def tone_durations(samples, sample_rate, frequencies, window_ms=20, threshold=AUDIBLE_SAMPLE_THRESHOLD):
-    window_size = max(sample_rate * window_ms // 1000, 1)
-    windows = {frequency: 0 for frequency in frequencies}
-    for offset in range(0, len(samples) - window_size + 1, window_size):
-        window = samples[offset : offset + window_size]
-        mean_square = sum(sample * sample for sample in window) / len(window)
-        if mean_square < threshold**2:
-            continue
-        winner = max(frequencies, key=lambda frequency: goertzel_power(window, sample_rate, frequency))
-        windows[winner] += 1
-    return {frequency: count * window_size / sample_rate for frequency, count in windows.items()}
-
 
 class ModuleIntegrationTest(unittest.TestCase):
     def setUp(self):
@@ -625,9 +423,8 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.assertNotIn(marker, module_log, "suppressed response or URI payload leaked into the module log")
         self.assertNotIn(encoded_final_payload, module_log, "suppressed final payload leaked into the module log")
 
-    def assert_playback_control_creates_silence(self, command, inverse_command, scenario):
-        control_hold_seconds = 0.3
-        resumed_playback_seconds = 0.35
+    def record_playback_control(self, command, inverse_command, scenario):
+        control_hold_seconds = 0.8
         with FreeSwitchEventSocket(self.uuid) as event_socket:
             self.start_stream(f"{MOCK_URL}/flow-control")
             self.start_recording(scenario)
@@ -639,9 +436,12 @@ class ModuleIntegrationTest(unittest.TestCase):
             )
 
             assert_ok(self, f"uuid_openai_audio_stream {self.uuid} {command}")
+            held_since = time.monotonic()
             time.sleep(control_hold_seconds)
             assert_ok(self, f"uuid_openai_audio_stream {self.uuid} {inverse_command}")
-            time.sleep(resumed_playback_seconds)
+            held_seconds = time.monotonic() - held_since
+            stopped = event_socket.wait_for(SPEECH_STOP_EVENT)
+            self.assertIsNotNone(stopped, "playback did not drain after releasing the control")
             sample_rate, samples = self.stop_recording()
 
         runs, _, _ = audio_activity_metrics(samples, sample_rate, window_ms=20)
@@ -651,14 +451,37 @@ class ModuleIntegrationTest(unittest.TestCase):
             control_hold_seconds / 2,
             f"{command} did not create the expected silent playback interval",
         )
-        self.assertAlmostEqual(dominant_frequency(samples, sample_rate), sent["frequency"], delta=75)
         self.stop_stream()
+        segments = tone_runs(samples, sample_rate, sent["frequencies"])
+        self.assertEqual(
+            [frequency for frequency, _ in segments],
+            sent["frequencies"],
+            "playback skipped or reordered the tone segments",
+        )
+        return dict(segments), sent["segment_duration"], held_seconds
 
     def test_pause_and_resume_control_playback(self):
-        self.assert_playback_control_creates_silence("pause", "resume", "pause-resume")
+        durations, segment_duration, _ = self.record_playback_control("pause", "resume", "pause-resume")
+        for frequency, duration in durations.items():
+            self.assertAlmostEqual(
+                duration, segment_duration, delta=0.08, msg=f"pause lost or duplicated {frequency} Hz audio"
+            )
+
+    def assert_playback_mute_discards_audio(self, target):
+        durations, segment_duration, held_seconds = self.record_playback_control(
+            f"mute {target}", f"unmute {target}", f"mute-{target}"
+        )
+        self.assertAlmostEqual(
+            sum(durations.values()),
+            3 * segment_duration - held_seconds,
+            delta=PLAYBACK_DURATION_TOLERANCE_SECONDS,
+            msg="mute preserved audio for later replay or discarded too much audio",
+        )
+        self.assertLess(durations[1100], segment_duration / 2, "muted middle segment was replayed")
+        self.assertAlmostEqual(durations[1500], segment_duration, delta=0.08)
 
     def test_openai_mute_controls_playback(self):
-        self.assert_playback_control_creates_silence("mute openai", "unmute openai", "openai-mute")
+        self.assert_playback_mute_discards_audio("openai")
 
     def test_playback_emits_speech_lifecycle_events(self):
         with FreeSwitchEventSocket(self.uuid) as event_socket:
@@ -1473,7 +1296,7 @@ class ModuleIntegrationTest(unittest.TestCase):
 
         assert_ok(self, f"uuid_break {self.uuid} all")
         assert_ok(self, f"uuid_broadcast {self.uuid} silence_stream://-1 aleg")
-        self.assert_playback_control_creates_silence("mute all", "unmute all", "mute-all")
+        self.assert_playback_mute_discards_audio("all")
 
     def test_invalid_mute_target_is_rejected(self):
         self.expect_module_errors("invalid mute target")
