@@ -165,6 +165,109 @@ class AudioStreamer {
         }
     }
 
+    ~AudioStreamer() {
+        disconnect();
+        deleteFiles();
+        if (m_resampler) {
+            speex_resampler_destroy(m_resampler);
+            m_resampler = nullptr;
+        }
+    }
+
+    bool start() {
+        // start_capture publishes the media bug and channel private before callbacks can run.
+        try {
+            webSocket.start();
+            m_started = true;
+            return true;
+        } catch (const std::exception& e) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "(%s) failed to start WebSocket thread: %s\n",
+                              m_sessionId.c_str(), e.what());
+            return false;
+        }
+    }
+
+    bool pop_audio_queue(std::vector<int16_t>& out_audio) {
+        return m_playback_queue.pop(out_audio);
+    }
+
+    bool isConnected() const {
+        return (webSocket.getReadyState() == ix::ReadyState::Open);
+    }
+
+    bool sendAudio(const uint8_t *buffer, size_t len) {
+        const bool sent = m_raw_audio_mode ? writeBinary(buffer, len) : writeAudioDelta(buffer, len);
+        if (!sent) {
+            if (!m_send_failure_logged.exchange(true)) {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                  "(%s) sendAudio: send failed or not connected, dropping caller audio\n",
+                                  m_sessionId.c_str());
+            }
+        } else if (m_send_failure_logged.exchange(false)) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "(%s) sendAudio: sending recovered\n",
+                              m_sessionId.c_str());
+        }
+        return sent;
+    }
+
+    bool writeText(const char *text) {
+        if (!isConnected())
+            return false;
+        return webSocket.sendUtf8Text(ix::IXWebSocketSendData(text, strlen(text))).success;
+    }
+
+    bool capture_reset_pending() const {
+        return m_capture_reset_pending.load(std::memory_order_acquire);
+    }
+
+    // Returns true once per pending reset request; media (stream_frame) thread only.
+    bool consume_capture_reset() {
+        return m_capture_reset_pending.exchange(false, std::memory_order_acq_rel);
+    }
+
+    // Returns true once per pending clear request; media (write_frame) thread only
+    bool consume_playback_clear() {
+        const uint64_t gen = m_playback_clear_gen.load(std::memory_order_acquire);
+        if (gen == m_playback_clear_gen_seen) {
+            return false;
+        }
+        m_playback_clear_gen_seen = gen;
+        return true;
+    }
+
+    bool is_openai_speaking() const {
+        return m_openai_speaking;
+    }
+
+    bool suppress_log() const {
+        return m_suppress_log;
+    }
+
+    bool is_response_audio_done() const {
+        return m_response_audio_done;
+    }
+
+    bool is_terminally_closed() const {
+        return m_terminal_close;
+    }
+
+    void openai_speech_started(switch_core_session_t *session) {
+        m_openai_speaking = true;
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) OpenAI started speaking\n",
+                          m_sessionId.c_str());
+        const char *payload = "{\"status\":\"started\"}";
+        m_notify(session, EVENT_OPENAI_SPEECH_STARTED, payload);
+    }
+
+    void openai_speech_stopped(switch_core_session_t *session) {
+        m_openai_speaking = false;
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) OpenAI stopped speaking\n",
+                          m_sessionId.c_str());
+        const char *payload = "{\"status\":\"stopped\"}";
+        m_notify(session, EVENT_OPENAI_SPEECH_STOPPED, payload);
+    }
+
+  private:
     void handleWebSocketMessage(const ix::WebSocketMessagePtr& message) {
         switch (message->type) {
             case ix::WebSocketMessageType::Message:
@@ -282,19 +385,6 @@ class AudioStreamer {
         eventCallback(event, json);
         cJSON_Delete(payload);
         switch_safe_free(json);
-    }
-
-    bool start() {
-        // start_capture publishes the media bug and channel private before callbacks can run.
-        try {
-            webSocket.start();
-            m_started = true;
-            return true;
-        } catch (const std::exception& e) {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "(%s) failed to start WebSocket thread: %s\n",
-                              m_sessionId.c_str(), e.what());
-            return false;
-        }
     }
 
     inline void request_media_bug_close() {
@@ -640,10 +730,6 @@ class AudioStreamer {
         }
     }
 
-    bool pop_audio_queue(std::vector<int16_t>& out_audio) {
-        return m_playback_queue.pop(out_audio);
-    }
-
     void resetPlaybackDecoderState() {
         m_pending_raw_byte = 0;
         m_has_pending_raw_byte = false;
@@ -653,15 +739,6 @@ class AudioStreamer {
                 switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "(%s) failed to reset playback resampler: %s\n",
                                   m_sessionId.c_str(), speex_resampler_strerror(result));
             }
-        }
-    }
-
-    ~AudioStreamer() {
-        disconnect();
-        deleteFiles();
-        if (m_resampler) {
-            speex_resampler_destroy(m_resampler);
-            m_resampler = nullptr;
         }
     }
 
@@ -675,10 +752,6 @@ class AudioStreamer {
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "(%s) failed to stop WebSocket thread: %s\n",
                               m_sessionId.c_str(), e.what());
         }
-    }
-
-    bool isConnected() const {
-        return (webSocket.getReadyState() == ix::ReadyState::Open);
     }
 
     // For all write methods, success means the payload was accepted by the WebSocket client while
@@ -709,27 +782,6 @@ class AudioStreamer {
         return webSocket.sendBinary(ix::IXWebSocketSendData(reinterpret_cast<const char *>(buffer), len)).success;
     }
 
-    bool sendAudio(const uint8_t *buffer, size_t len) {
-        const bool sent = m_raw_audio_mode ? writeBinary(buffer, len) : writeAudioDelta(buffer, len);
-        if (!sent) {
-            if (!m_send_failure_logged.exchange(true)) {
-                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                                  "(%s) sendAudio: send failed or not connected, dropping caller audio\n",
-                                  m_sessionId.c_str());
-            }
-        } else if (m_send_failure_logged.exchange(false)) {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "(%s) sendAudio: sending recovered\n",
-                              m_sessionId.c_str());
-        }
-        return sent;
-    }
-
-    bool writeText(const char *text) {
-        if (!isConnected())
-            return false;
-        return webSocket.sendUtf8Text(ix::IXWebSocketSendData(text, strlen(text))).success;
-    }
-
     void deleteFiles() {
         for (const auto& fileName : m_Files) {
             std::remove(fileName.c_str());
@@ -743,59 +795,6 @@ class AudioStreamer {
     void request_capture_reset() {
         m_capture_reset_pending.store(true, std::memory_order_release);
     }
-
-    bool capture_reset_pending() const {
-        return m_capture_reset_pending.load(std::memory_order_acquire);
-    }
-
-    // Returns true once per pending reset request; media (stream_frame) thread only.
-    bool consume_capture_reset() {
-        return m_capture_reset_pending.exchange(false, std::memory_order_acq_rel);
-    }
-
-    // Returns true once per pending clear request; media (write_frame) thread only
-    bool consume_playback_clear() {
-        const uint64_t gen = m_playback_clear_gen.load(std::memory_order_acquire);
-        if (gen == m_playback_clear_gen_seen) {
-            return false;
-        }
-        m_playback_clear_gen_seen = gen;
-        return true;
-    }
-
-    bool is_openai_speaking() const {
-        return m_openai_speaking;
-    }
-
-    bool suppress_log() const {
-        return m_suppress_log;
-    }
-
-    bool is_response_audio_done() const {
-        return m_response_audio_done;
-    }
-
-    bool is_terminally_closed() const {
-        return m_terminal_close;
-    }
-
-    void openai_speech_started(switch_core_session_t *session) {
-        m_openai_speaking = true;
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) OpenAI started speaking\n",
-                          m_sessionId.c_str());
-        const char *payload = "{\"status\":\"started\"}";
-        m_notify(session, EVENT_OPENAI_SPEECH_STARTED, payload);
-    }
-
-    void openai_speech_stopped(switch_core_session_t *session) {
-        m_openai_speaking = false;
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) OpenAI stopped speaking\n",
-                          m_sessionId.c_str());
-        const char *payload = "{\"status\":\"stopped\"}";
-        m_notify(session, EVENT_OPENAI_SPEECH_STOPPED, payload);
-    }
-
-  private:
     std::string m_sessionId;
     responseHandler_t m_notify;
     ix::WebSocket webSocket;
