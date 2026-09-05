@@ -1,81 +1,76 @@
 # Tests
 
-The test suite has two layers:
+Run the fast suite with `./tests/run-unit.sh`; run the complete suite with `./tests/run-integration.sh`.
+Both entry points are POSIX `sh` scripts and use the same commands locally and in GitHub Actions.
 
-- `unit`: fast tests for production code that has no FreeSWITCH dependency;
-- `integration`: tests that build and load the module in a real FreeSWITCH process and connect it to a local mock
-  WebSocket server.
+## Responsibilities
 
-The test suite has its own CMake project under `tests/`, so configuring the module itself behaves exactly as before.
+| Entry point | Runs where | Responsibility |
+| --- | --- | --- |
+| `run-unit.sh` | Host or container | Configure the standalone test CMake project, build, and run CTest. |
+| `run-integration.sh` | Host | Select the FreeSWITCH base image, add this checkout, and start a fresh container. |
+| `run-ci.sh` | Container | Run sanitized unit tests, build the lifecycle probe and sanitized module, install it, and invoke integration. |
+| `integration/run.sh` | Container | Start the mock and FreeSWITCH, check readiness, run Python assertions, unload, shut down, and collect diagnostics. |
 
-## Unit tests
+CMake/CTest owns test discovery and failure reporting for the fast suite. Python `unittest` owns integration
+assertions; the shell scripts manage processes. `integration/esl.py` handles event-socket framing and
+`integration/audio.py` measures recordings. Neither helper needs FreeSWITCH to import.
 
-Run all unit tests:
+## Fast suite
+
+Requirements: a C/C++ toolchain, CMake 3.18 or newer, and Python 3.9 or newer. FreeSWITCH is not required.
 
 ```sh
 ./tests/run-unit.sh
-```
-
-Run them with AddressSanitizer and UndefinedBehaviorSanitizer when the compiler runtimes are installed:
-
-```sh
 ./tests/run-unit.sh --sanitizers
 ```
 
-Normal and sanitized runs use separate build directories, so switching between them cannot retain stale CMake
-options. GCC installations may provide the sanitizer runtimes in separate system packages.
+CTest runs three C++ executables with 18 cases and five Python ESL cases. The C++ tests compile the production
+`stream_protocol.cpp`, `base64.cpp`, and `playback_queue.cpp`; there are no copied implementations or fake FreeSWITCH
+headers. Their small `CHECK` harness remains active in Release builds. The ESL tests use local socket pairs to check
+fragmentation, timeout recovery, packet deadlines, coalesced packets, filtering, and connection closure.
 
-The unit executables are registered with CTest. The manual commands below default to two parallel jobs for
-portability; set `CMAKE_BUILD_PARALLEL_LEVEL` to override the default:
-
-```sh
-cmake -S tests -B build/tests
-cmake --build build/tests --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
-cd build/tests
-ctest --output-on-failure --no-tests=error
-```
-
-These tests compile the same `stream_protocol.cpp`, `base64.cpp`, and `playback_queue.cpp` files linked into the
-FreeSWITCH module. No copied implementations or fake FreeSWITCH headers are used.
-
-## Integration tests
-
-The integration image is built from the `integration` target in `Dockerfile.ci`. It extends the CI SDK with the
-pinned FreeSWITCH runtime, its test configuration, and Python. The module and tests are not embedded in the image:
-they are built from the current checkout and executed every time the container starts.
-
-The mock server sends known PCM16 tones which are recorded from the FreeSWITCH channel and analysed for timing,
-audible duration, and dominant frequency. The playback tests exercise normal delivery, repeated buffer underruns,
-pause/resume and mute/unmute, public speech lifecycle events, barge-in buffer clearing, and the private lifecycle and
-PCM16 alignment of temporary debug WAV files. A compatibility scenario also reuses `response_id` for a later response
-and verifies that the peer-provided ID does not suppress valid playback audio. Invalid audio deltas received after
-completion must not suppress the final playback-stop event. Peer-close cleanup is also verified while playback is
-paused.
-Raw mode is covered in both directions, including binary PCM playback split across odd WebSocket frame boundaries.
-The raw playback suite verifies that PCM carry and resampler state do not cross an interrupted stream boundary, and
-that PCM carry is reset after a discarded oversized binary frame.
-Capture tests verify configured packet aggregation, mono/stereo channel separation, user mute/unmute semantics, and
-WebSocket header precedence. Reconnection tests hold the handshake while the capture source changes, proving that
-audio buffered before a dropped or initially failed connection cannot reach the next connection. The suite also
-checks actionable connection-error diagnostics and payload suppression in logs without event suppression.
-Suppression is verified as a per-stream setting captured at start, including for transport connection errors.
-Malformed or sample-misaligned data observed by the mock is rejected.
-Outbound JSON commands reject malformed Base64, invalid UTF-8, embedded NUL bytes, and trailing non-JSON data; the
-same validation applies to the optional final payload sent during stream teardown. Valid command payloads retain
-their original numeric and string values. Inbound JSON must be complete and free of raw NUL bytes, and malformed
-Base64 audio deltas cannot carry partial PCM state into later playback.
+Normal and sanitized runs use separate directories, `build/tests` and `build/tests-sanitized`. Set `BUILD_DIR` to
+override the directory and `CMAKE_BUILD_PARALLEL_LEVEL` to limit parallel builds. GCC sanitizer runtimes may need
+separate system packages. To run one registered test after building:
 
 ```sh
-./tests/run-integration.sh
+ctest --test-dir build/tests --output-on-failure -R '^esl$'
 ```
 
-By default, the script pulls the verified `integration` alias published by this repository. While the package is
-private, authorized users can authenticate with `docker login ghcr.io`; other users automatically use a cached copy
-or build the `integration` target locally. `tests/Dockerfile` then adds the current checkout without embedding it in
-the base image, and `tests/run-integration.sh` starts a fresh test container.
+## FreeSWITCH integration
 
-A cold local fallback compiles FreeSWITCH and can take up to one hour; subsequent unchanged builds reuse Docker's
-layer cache. To validate changes to `Dockerfile.ci`, explicitly build and select a local base image:
+```sh
+TEST_ARTIFACT_DIR=/tmp/mod-openai-test-artifacts ./tests/run-integration.sh
+```
+
+The suite loads the real module in the pinned FreeSWITCH runtime and connects it to a local WebSocket mock. Calls
+use a `null/` endpoint with an active media source. Tests observe public APIs, custom ESL events, backend messages,
+module logs, and recorded PCM16 audio.
+
+| Contract | Evidence |
+| --- | --- |
+| Playback, resampling, underruns, interruption | Recorded tone frequencies, audible durations, ordered segments, and speech events. |
+| Pause versus mute | Pause preserves every tone through completion; mute consumes the held interval and never replays it after unmute. |
+| Capture and reconnection | Packet sizes, stereo channel separation, mute silence, and gated reconnects that reject stale audio. |
+| Protocol validation and compatibility | Malformed JSON/Base64/UTF-8, odd PCM boundaries, raw transport, opaque reused/missing `response_id`, and preserved valid payloads. |
+| Lifecycle and diagnostics | Restart, terminal close while paused, overlapping stop/hangup, private debug WAVs, header precedence, and log suppression. |
+
+`lifecycle_probe.c` is a test-only shared library preloaded into FreeSWITCH. File barriers hold the API stop just
+before removal to verify that capture cannot follow the final payload, including buffered residue. They also let
+hangup enter CLOSE under the FreeSWITCH media-bug lock: stop must finish, the channel must disappear, and the
+WebSocket must disconnect. The runner also requires successful module unload. This exercises the real lock
+ordering without relying on repeated scheduling races. The probe is built only with
+`BUILD_INTEGRATION_TESTS=ON` in the standalone test project; it is never linked into or shipped with the module.
+
+ASan and UBSan cover the module and its compiled IXWebSocket code. FreeSWITCH and SpeexDSP in the base are not fully
+sanitized. LeakSanitizer is disabled inside FreeSWITCH; TSan is not run. The suite does not certify SIP/RTP network
+behavior, runtime WSS certificate verification, stereo playback codecs, mid-call codec changes, or slow-peer
+backpressure. Add those scenarios when changing their contracts.
+
+The host script defaults to the verified GHCR `integration` alias. Authenticate with `docker login ghcr.io` when the
+package requires access; otherwise the script uses a cached image or builds the base locally. A cold fallback can
+take up to one hour because it compiles FreeSWITCH. To test a changed base explicitly:
 
 ```sh
 docker build --file Dockerfile.ci --target integration \
@@ -83,32 +78,24 @@ docker build --file Dockerfile.ci --target integration \
 INTEGRATION_BASE_IMAGE=mod-openai-realtime-integration:local ./tests/run-integration.sh
 ```
 
-`INTEGRATION_BASE_IMAGE` can also select another published tag or digest.
-`TEST_IMAGE` controls the local runner image name. The previous `INTEGRATION_IMAGE` override remains supported as an
-alias for `TEST_IMAGE`.
-Set `TEST_ARTIFACT_DIR` to retain mock events, FreeSWITCH logs, and playback recordings. GitHub Actions enables this
-automatically and uploads the directory for seven days only when the test job fails.
+`INTEGRATION_BASE_IMAGE` accepts a local tag or published digest. `TEST_IMAGE` names the checkout runner, defaulting
+to `mod-openai-realtime-tests:local`; the previous `INTEGRATION_IMAGE` name remains an alias for this override.
+Reuse these tags while iterating. Remove only obsolete images belonging to this project, keeping the main base
+and current runner. `run-ci.sh` installs into the container and must not be invoked directly on the host.
 
-`tests/run-ci.sh` is an internal container entry point shared by local Docker runs and GitHub Actions; do not invoke
-it directly on the host. It runs the sanitized unit suite, builds and installs a sanitized module, and then starts
-the real FreeSWITCH integration suite. Sanitizers remain disabled for normal module builds and releases.
+## CI and failure diagnostics
 
-## CI image lifecycle
+Build checks compile Release with TLS enabled and disabled. Static Checks runs clang-format, clang-tidy, cppcheck,
+ShellCheck, actionlint, and Ruff. Tests runs the sanitized fast and integration suites. The image-check and
+image-publishing workflows run the same suite. Every integration workflow retains logs, mock events, and WAVs as
+artifacts for seven days on failure; `TEST_ARTIFACT_DIR` enables the same collection locally.
 
-GitHub Actions pins both the SDK and integration environments to immutable digests. Normal pull requests therefore
-build only the module and test runner; they do not rebuild FreeSWITCH. Pull requests that change `Dockerfile.ci` are
-also covered by the `CI Image Checks` workflow, which builds and tests the modified integration target before merge.
+SDK and integration environments in the consumer workflows are pinned to immutable digests. Ordinary pull requests
+build the module and checkout runner without rebuilding FreeSWITCH. `CI Image Checks` builds and tests base-image
+changes before merge. `CI Images` publishes commit tags, tests the published integration digest, and only then
+promotes the `sdk` and `integration` aliases. Update the SDK digests in `build.yml` and `code-checks.yml` together with
+the integration digest in `tests.yml`, using the same verified publisher run.
 
-After such a pull request is merged, the `CI Images` workflow publishes `sdk-<commit>` and `integration-<commit>`,
-tests the published integration digest, and only then updates the `sdk` and `integration` aliases. The consumer
-workflow digests are updated in a follow-up pull request, so an image is never consumed merely because a moving alias
-changed. Update the SDK references in `build.yml` and `code-checks.yml` together with the integration reference in
-`tests.yml`, using digests from the same `CI Images` run.
-
-Keep every image digest referenced by the default branch and at least one previous known-good version for rollback.
-Unreferenced per-commit images, especially images left by failed publisher runs, can be removed according to the
-repository's GHCR retention policy.
-
-Dependabot checks the SHA-pinned GitHub Actions monthly. The Debian base is referenced through the
-`DEBIAN_IMAGE` build argument, so its digest must be reviewed and updated manually; the resulting pull request must
-pass `CI Image Checks` before merge.
+Keep referenced image digests and one previous known-good version for rollback. Dependabot checks action SHAs
+monthly; the Debian digest in `DEBIAN_IMAGE` needs a manual update validated by `CI Image Checks`. Requiring the
+workflow results before merge is a repository ruleset setting, separate from these YAML files.

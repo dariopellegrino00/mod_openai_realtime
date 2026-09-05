@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 published_base_image=ghcr.io/voismart/mod-openai-realtime-ci:integration
 base_image=${INTEGRATION_BASE_IMAGE:-${published_base_image}}
 legacy_test_image=${INTEGRATION_IMAGE-}
@@ -46,7 +46,7 @@ docker_build \
 
 if [ -n "${TEST_ARTIFACT_DIR:-}" ]; then
     mkdir -p "${TEST_ARTIFACT_DIR}"
-    artifact_dir=$(CDPATH= cd -- "${TEST_ARTIFACT_DIR}" && pwd)
+    artifact_dir=$(CDPATH='' cd -- "${TEST_ARTIFACT_DIR}" && pwd)
     docker run --rm \
         --env TEST_ARTIFACT_DIR=/test-artifacts \
         --volume "${artifact_dir}:/test-artifacts:Z" \

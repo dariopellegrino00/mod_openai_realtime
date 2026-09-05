@@ -8,7 +8,7 @@ freeswitch_log=/tmp/mod-openai-freeswitch.log
 freeswitch_runtime_log=/usr/var/log/freeswitch/freeswitch.log
 freeswitch_local_runtime_log=/usr/local/freeswitch/log/freeswitch.log
 freeswitch_pid_file=/usr/var/run/freeswitch/freeswitch.pid
-project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 artifact_dir=${TEST_ARTIFACT_DIR:-}
 
 if [ -n "${artifact_dir}" ]; then

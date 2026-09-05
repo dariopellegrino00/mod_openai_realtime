@@ -3,7 +3,6 @@ cmake-build-debug/
 .vscode/
 build*/
 _packages
-test_tools/
 __pycache__/
 *.pyc
 .mypy_cache/

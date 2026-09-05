@@ -13,6 +13,27 @@ permissions:
   packages: read
 
 jobs:
+  lint:
+    name: Scripts and workflows
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install linters
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y shellcheck
+          python3 -m pip install --disable-pip-version-check ruff==0.12.12
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Lint
+        run: |
+          shellcheck tests/run-*.sh tests/integration/run.sh
+          actionlint
+          ruff check tests
+
   analyze:
     runs-on: ubuntu-22.04
     container:
@@ -32,13 +53,11 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Format check
+        shell: bash
         run: |
           set -eux
-          ALL_FILES="$(git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp')"
-          FILES="$(echo "$ALL_FILES" | grep -v '^libs/' || true)"
-          if [ -n "$FILES" ]; then
-            clang-format --dry-run --Werror $FILES
-          fi
+          git ls-files -z -- '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp' ':!:libs' |
+            xargs -0 -r clang-format --dry-run --Werror
 
       - name: Configure
         run: |
@@ -55,21 +74,13 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang++
 
       - name: Analyze
+        shell: bash
         run: |
           set -eux
-          ALL_FILES="$(git ls-files '*.c' '*.cc' '*.cpp' '*.cxx')"
-          MODULE_FILES="$(echo "$ALL_FILES" | grep -Ev '^(libs|tests)/' || true)"
-          TEST_FILES="$(echo "$ALL_FILES" | grep '^tests/' || true)"
-          if [ -n "$MODULE_FILES" ]; then
-            clang-tidy --config-file=.clang-tidy -p build $MODULE_FILES
-          else
-            echo "No module source files found for clang-tidy analysis."
-          fi
-          if [ -n "$TEST_FILES" ]; then
-            clang-tidy --config-file=.clang-tidy -p build-tests $TEST_FILES
-          else
-            echo "No test source files found for clang-tidy analysis."
-          fi
+          git ls-files -z -- '*.c' '*.cc' '*.cpp' '*.cxx' ':!:libs' ':!:tests' |
+            xargs -0 -r clang-tidy --config-file=.clang-tidy -p build
+          git ls-files -z -- 'tests/*.c' 'tests/*.cc' 'tests/*.cpp' 'tests/*.cxx' |
+            xargs -0 -r clang-tidy --config-file=.clang-tidy -p build-tests
 
           : > cppcheck-warn.log
           for compile_commands in build/compile_commands.json build-tests/compile_commands.json; do

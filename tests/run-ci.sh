@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 build_root=${BUILD_ROOT:-/tmp/mod-openai-realtime-build}
 parallel_jobs=${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}
 
