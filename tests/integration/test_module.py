@@ -57,10 +57,13 @@ def assert_ok(test, command):
     return result
 
 
-def assert_error(test, command):
+def assert_error(test, command, expected_message=None):
     result = api(command)
     lines = result.splitlines()
-    test.assertTrue(lines and lines[-1].startswith("-ERR"), f"command unexpectedly succeeded: {command}\n{result}")
+    test.assertEqual(len(lines), 1, f"command did not return one error line: {command}\n{result}")
+    test.assertTrue(result.startswith("-ERR "), f"command unexpectedly succeeded: {command}\n{result}")
+    if expected_message is not None:
+        test.assertIn(expected_message, result)
     return result
 
 
@@ -103,7 +106,7 @@ def wait_for_realtime_playback(duration_seconds):
     # The mock queues audio immediately, but FreeSWITCH consumes it at media rate.
     time.sleep(duration_seconds + PLAYBACK_DRAIN_MARGIN_SECONDS)
 
-class ModuleIntegrationTest(unittest.TestCase):
+class ModuleIntegrationBase(unittest.TestCase):
     def setUp(self):
         self.uuid = None
         self.recording = None
@@ -321,6 +324,9 @@ class ModuleIntegrationTest(unittest.TestCase):
         frequency = dominant_frequency(samples, sample_rate)
         self.assertAlmostEqual(frequency, expected_frequency, delta=75)
 
+
+
+class ModuleIntegrationTest(ModuleIntegrationBase):
     @contextmanager
     def hold_stop_before_removal(self, command):
         markers = {
@@ -1183,16 +1189,20 @@ class ModuleIntegrationTest(unittest.TestCase):
         )
         self.start_stream()
 
-        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json %%%=")
-        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json eyJhIjoxfQ=!")
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json %%%=", "Invalid Base64 JSON payload")
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json eyJhIjoxfQ=!", "Invalid Base64 JSON payload")
         invalid_json = base64.b64encode(b'{"type":').decode("ascii")
-        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {invalid_json}")
+        assert_error(
+            self, f"uuid_openai_audio_stream {self.uuid} send_json {invalid_json}", "Payload is not a complete JSON value"
+        )
         trailing_data = base64.b64encode(b'{"type":"integration.trailing"}garbage').decode("ascii")
-        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {trailing_data}")
+        assert_error(
+            self, f"uuid_openai_audio_stream {self.uuid} send_json {trailing_data}", "Payload is not a complete JSON value"
+        )
         embedded_nul = base64.b64encode(b'{"type":"integration.nul"}\0ignored').decode("ascii")
-        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {embedded_nul}")
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {embedded_nul}", "JSON payload contains a NUL byte")
         invalid_utf8 = base64.b64encode(b'{"type":"\xff"}').decode("ascii")
-        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {invalid_utf8}")
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {invalid_utf8}", "JSON payload is not valid UTF-8")
 
         before = len(mock_events())
         trailing_whitespace = base64.b64encode(b'{"type":"integration.whitespace"} \r\n\t').decode("ascii")
@@ -1255,7 +1265,10 @@ class ModuleIntegrationTest(unittest.TestCase):
 
         before = len(mock_events())
         invalid_utf8 = base64.b64encode(b'{"type":"\xff"}').decode("ascii")
-        assert_error(self, f"uuid_openai_audio_stream {self.uuid} stop {invalid_utf8}")
+        assert_error(
+            self, f"uuid_openai_audio_stream {self.uuid} stop {invalid_utf8}",
+            "Stream stopped; final message failed: JSON payload is not valid UTF-8",
+        )
         disconnected = wait_for_event(lambda event: event.get("event") == "disconnected", before)
         self.assertIsNotNone(disconnected, "WebSocket did not disconnect after rejecting the final payload")
 

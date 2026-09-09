@@ -280,12 +280,33 @@ Keeps the media bug alive while silencing the selected leg. Defaults to `user` w
 
 - `user`: block caller audio being sent to OpenAI.
 - `openai`: block OpenAI playback from reaching the channel.
-- `all`: apply both mute operations at once.
+- `all`: attempt both mute operations; an error does not undo either operation.
+
+When `mute` changes caller audio from unmuted to muted, the module flushes buffered caller audio and sends
+a block containing one second of silence if the WebSocket is connected.
 
 ```text
 uuid_openai_audio_stream <uuid> unmute [user | openai | all]
 ```
 Re-enables the selected audio leg after a corresponding `mute`. Defaults to `user` when omitted.
+
+### Command responses
+
+Successful commands retain the response `+OK Success`. Failures return one `-ERR` line with a reason:
+
+```text
+-ERR Stream not found
+-ERR Stream already exists
+-ERR Invalid send sample rate; expected a multiple of 8000 from 8000 to 48000
+```
+
+Check the `+OK` or `-ERR` prefix in clients; diagnostic wording is intended for humans. Error replies do not echo
+connection URIs, credentials or JSON payloads. Calling either API without arguments still displays its usage.
+
+For `start`, `+OK` confirms local startup; wait for `connect` before treating the WebSocket as connected. Connection
+failures are asynchronous `error` events. Some control failures occur after a state change: a rejected final stop
+payload returns `Stream stopped; final message failed: ...`, while failure to send mute silence reports
+`User audio muted; ...`. In both cases the indicated stop or mute has already taken effect.
 
 ## Events
 

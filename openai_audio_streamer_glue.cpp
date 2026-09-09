@@ -1055,9 +1055,11 @@ struct SessionContext {
     }
 };
 
-bool find_session_context(switch_core_session_t *session, const char *operation, SessionContext& context) {
+bool find_session_context(switch_core_session_t *session, const char *operation, SessionContext& context,
+                          stream_error_t *error) {
     if (!session) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "%s failed: no session found.\n", operation);
+        stream_fail(error, "Channel not found");
         return false;
     }
 
@@ -1065,6 +1067,7 @@ bool find_session_context(switch_core_session_t *session, const char *operation,
     if (!channel) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "%s failed: no channel found.\n",
                           operation);
+        stream_fail(error, "Channel not found");
         return false;
     }
 
@@ -1076,6 +1079,7 @@ bool find_session_context(switch_core_session_t *session, const char *operation,
     if (!context.bug) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "%s failed: no media bug found.\n",
                           operation);
+        stream_fail(error, "Stream not found");
         return false;
     }
     return true;
@@ -1096,9 +1100,10 @@ int validate_ws_uri(const char *url, char *wsUri) {
     return stream_protocol::validate_ws_uri(url, wsUri, MAX_WS_URI) ? 1 : 0;
 }
 
-switch_status_t stream_session_send_json(switch_core_session_t *session, const char *base64_input) {
+switch_status_t stream_session_send_json(switch_core_session_t *session, const char *base64_input,
+                                         stream_error_t *error) {
     SessionContext context{};
-    if (!find_session_context(session, "stream_session_send_json", context)) {
+    if (!find_session_context(session, "stream_session_send_json", context, error)) {
         return SWITCH_STATUS_FALSE;
     }
 
@@ -1106,13 +1111,13 @@ switch_status_t stream_session_send_json(switch_core_session_t *session, const c
     if (!streamer) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "stream_session_send_json failed: AudioStreamer websocket is null.\n");
-        return SWITCH_STATUS_FALSE;
+        return stream_fail(error, "Stream is closing");
     }
 
     if (!base64_input || strlen(base64_input) == 0) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "stream_session_send_json failed: input is empty.\n");
-        return SWITCH_STATUS_FALSE;
+        return stream_fail(error, "JSON payload is empty");
     }
     std::string decoded_str;
     try {
@@ -1120,22 +1125,22 @@ switch_status_t stream_session_send_json(switch_core_session_t *session, const c
     } catch (const std::exception& e) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "stream_session_send_json failed: base64 decode error: %s\n", e.what());
-        return SWITCH_STATUS_FALSE;
+        return stream_fail(error, "Invalid Base64 JSON payload");
     }
     if (decoded_str.empty()) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "stream_session_send_json base64 decode failed.\n");
-        return SWITCH_STATUS_FALSE;
+        return stream_fail(error, "JSON payload is empty");
     }
     if (decoded_str.find('\0') != std::string::npos) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "stream_session_send_json failed: decoded JSON contains a NUL byte.\n");
-        return SWITCH_STATUS_FALSE;
+        return stream_fail(error, "JSON payload contains a NUL byte");
     }
     if (!stream_protocol::is_valid_utf8(decoded_str.c_str())) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "stream_session_send_json failed: decoded JSON contains invalid UTF-8.\n");
-        return SWITCH_STATUS_FALSE;
+        return stream_fail(error, "JSON payload is not valid UTF-8");
     }
 
     const char *parse_end = decoded_str.c_str();
@@ -1151,7 +1156,7 @@ switch_status_t stream_session_send_json(switch_core_session_t *session, const c
                               "stream_session_send_json failed: invalid JSON. Error near: %s\n",
                               parse_end ? parse_end : "unknown");
         }
-        return SWITCH_STATUS_FALSE;
+        return stream_fail(error, "Payload is not a complete JSON value");
     }
 
     cJSON_Delete(json_obj);
@@ -1161,12 +1166,16 @@ switch_status_t stream_session_send_json(switch_core_session_t *session, const c
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
                           "stream_session_send_json: sending JSON: %s\n", decoded_str.c_str());
     }
-    return streamer->writeText(decoded_str.c_str()) ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+    if (!streamer->isConnected()) {
+        return stream_fail(error, "WebSocket is not connected");
+    }
+    return streamer->writeText(decoded_str.c_str()) ? SWITCH_STATUS_SUCCESS
+                                                    : stream_fail(error, "WebSocket did not accept the JSON message");
 }
 
-switch_status_t stream_session_pauseresume(switch_core_session_t *session, int pause) {
+switch_status_t stream_session_pauseresume(switch_core_session_t *session, int pause, stream_error_t *error) {
     SessionContext context{};
-    if (!find_session_context(session, "stream_session_pauseresume", context)) {
+    if (!find_session_context(session, "stream_session_pauseresume", context, error)) {
         return SWITCH_STATUS_FALSE;
     }
 
@@ -1175,10 +1184,10 @@ switch_status_t stream_session_pauseresume(switch_core_session_t *session, int p
     return SWITCH_STATUS_SUCCESS;
 }
 
-switch_status_t stream_session_set_user_mute(switch_core_session_t *session, int mute) {
+switch_status_t stream_session_set_user_mute(switch_core_session_t *session, int mute, stream_error_t *error) {
     SessionContext context{};
     switch_status_t status = SWITCH_STATUS_FALSE;
-    if (!find_session_context(session, "stream_session_set_user_mute", context)) {
+    if (!find_session_context(session, "stream_session_set_user_mute", context, error)) {
         return status;
     }
     private_t *tech_pvt = context.data;
@@ -1201,7 +1210,7 @@ switch_status_t stream_session_set_user_mute(switch_core_session_t *session, int
         // Deliver the residual pre-mute speech before injecting silence, instead of dropping it
         flush_capture_residue(tech_pvt);
         if (!reset_capture_resampler(tech_pvt)) {
-            status = SWITCH_STATUS_FALSE;
+            status = stream_fail(error, "User audio muted; failed to reset the capture resampler");
         }
 
         AudioStreamer *streamer = audio_streamer(tech_pvt);
@@ -1215,19 +1224,19 @@ switch_status_t stream_session_set_user_mute(switch_core_session_t *session, int
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
                                   "Sent %zu bytes of silence after muting user audio\n", silence.size());
             } else {
-                status = SWITCH_STATUS_FALSE;
+                status = stream_fail(error, "User audio muted; WebSocket did not accept mute silence");
             }
         } else {
-            status = SWITCH_STATUS_FALSE;
+            status = stream_fail(error, "User audio muted; WebSocket is not connected");
         }
     }
 
     return status;
 }
 
-switch_status_t stream_session_set_openai_mute(switch_core_session_t *session, int mute) {
+switch_status_t stream_session_set_openai_mute(switch_core_session_t *session, int mute, stream_error_t *error) {
     SessionContext context{};
-    if (!find_session_context(session, "stream_session_set_openai_mute", context)) {
+    if (!find_session_context(session, "stream_session_set_openai_mute", context, error)) {
         return SWITCH_STATUS_FALSE;
     }
     private_t *tech_pvt = context.data;
@@ -1732,15 +1741,16 @@ void stream_session_close(switch_core_session_t *session, void *user_data) {
     switch_mutex_unlock(tech_pvt->mutex);
 }
 
-switch_status_t stream_session_cleanup(switch_core_session_t *session, char *text) {
+switch_status_t stream_session_cleanup(switch_core_session_t *session, const char *text, stream_error_t *error) {
     // The API lifecycle lock serializes stop with start. CLOSE instead uses the
     // context mutex, which must be released before acquiring FreeSWITCH bug_rwlock.
     private_t *tech_pvt;
     switch_atomic_t was_paused;
     switch_status_t status = SWITCH_STATUS_SUCCESS;
+    stream_error_t payload_error = {};
     {
         SessionContext context{};
-        if (!find_session_context(session, "stream_session_cleanup", context)) {
+        if (!find_session_context(session, "stream_session_cleanup", context, error)) {
             return SWITCH_STATUS_FALSE;
         }
         tech_pvt = context.data;
@@ -1749,7 +1759,7 @@ switch_status_t stream_session_cleanup(switch_core_session_t *session, char *tex
         switch_atomic_set(&tech_pvt->audio_paused, 1);
         flush_capture_residue(tech_pvt);
         if (text && *text) {
-            status = stream_session_send_json(session, text);
+            status = stream_session_send_json(session, text, &payload_error);
         }
     }
 
@@ -1765,7 +1775,11 @@ switch_status_t stream_session_cleanup(switch_core_session_t *session, char *tex
     if (!removed) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "stream_session_cleanup: failed to remove media bug\n");
-        return SWITCH_STATUS_FALSE;
+        return stream_fail(error, "Failed to stop stream");
+    }
+    if (status != SWITCH_STATUS_SUCCESS && error) {
+        switch_snprintf(error->message, sizeof(error->message), "Stream stopped; final message failed: %s",
+                        payload_error.message);
     }
     return status;
 }

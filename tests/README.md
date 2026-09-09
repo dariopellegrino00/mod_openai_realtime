@@ -13,7 +13,7 @@ Both entry points are POSIX `sh` scripts and use the same commands locally and i
 | `integration/run.sh` | Container | Start the mock and FreeSWITCH, check readiness, run Python assertions, unload, shut down, and collect diagnostics. |
 
 CMake/CTest owns test discovery and failure reporting for the fast suite. Python `unittest` owns integration
-assertions; the shell scripts manage processes. `integration/esl.py` handles event-socket framing and
+assertions and discovers `integration/test_*.py`; the shell scripts manage processes. `integration/esl.py` handles event-socket framing and
 `integration/audio.py` measures recordings. Neither helper needs FreeSWITCH to import.
 
 ## Fast suite
@@ -54,6 +54,7 @@ module logs, and recorded PCM16 audio.
 | Pause versus mute | Pause preserves every tone through completion; mute consumes the held interval and never replays it after unmute. |
 | Capture and reconnection | Packet sizes, stereo channel separation, mute silence, and gated reconnects that reject stale audio. |
 | Protocol validation and compatibility | Malformed JSON/Base64/UTF-8, odd PCM boundaries, raw transport, opaque reused/missing `response_id`, and preserved valid payloads. |
+| API errors | One actionable error line, unchanged success responses, private payloads, and explicit stop/mute side effects. |
 | Lifecycle and diagnostics | Restart, terminal close while paused, overlapping stop/hangup, private debug WAVs, header precedence, and log suppression. |
 
 `lifecycle_probe.c` is a test-only shared library preloaded into FreeSWITCH. File barriers hold the API stop just

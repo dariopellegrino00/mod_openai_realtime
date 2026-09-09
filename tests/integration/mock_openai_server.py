@@ -47,7 +47,7 @@ class MockRealtimeServer:
                 body,
             )
         if (
-            path in {"/gated-reconnect", "/gated-initial-connect"}
+            path in {"/gated-reconnect", "/gated-initial-connect", "/gated-api-errors"}
             and handshake_number > 1
             and not self.reconnect_gate.exists()
         ):
@@ -96,7 +96,10 @@ class MockRealtimeServer:
                     continue
 
                 message_type = payload.get("type", "")
-                if path in {"/close-on-command", "/gated-reconnect"} and message_type == "integration.close":
+                if (
+                    path in {"/close-on-command", "/gated-reconnect", "/gated-api-errors"}
+                    and message_type == "integration.close"
+                ):
                     await websocket.close(code=1011, reason="intentional paused-close integration test")
                     await self.record("closed", path=path, connection_number=connection_number)
                     return
