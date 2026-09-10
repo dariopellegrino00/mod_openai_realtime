@@ -68,6 +68,7 @@ it is not shipped with the module. Lifecycle checks exercise both default and na
 
 Named-stream tests in `integration/test_stream_instances.py` cover three simultaneous backends, per-stream
 controls/settings/events/files, disabled audio directions, playback ownership, and isolated close/hangup.
+Stream-list tests check filters, current state, credential privacy, unrelated media bugs, reconnects, and name reuse.
 
 ASan/UBSan cover the module and its compiled IXWebSocket code, not all of FreeSWITCH or SpeexDSP. LeakSanitizer
 is disabled inside FreeSWITCH; TSan is not run. The suite does not certify real OpenAI behavior, SIP/RTP networking,

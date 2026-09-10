@@ -274,7 +274,8 @@ static switch_status_t send_json(switch_core_session_t *session, const char *bug
     " <uuid> stop [base64json] [stream=<name>]\n" api_name " <uuid> <pause|resume> [stream=<name>]\n" api_name         \
     " <uuid> <mute|unmute> [send|recv|all] [stream=<name>]\n"                                                          \
     "  Mute aliases: user=send, openai=recv, both=all. Default target: send.\n" api_name                               \
-    " <uuid> send_json <base64json> [stream=<name>]\n"
+    " <uuid> send_json <base64json> [stream=<name>]\n" api_name " <uuid> list [stream=<name>]\n"                       \
+    "  List returns +OK followed by a JSON array; without a selector it lists all streams.\n"
 
 #define STREAM_API_SYNTAX STREAM_API_SYNTAX_BODY("uuid_openai_audio_stream")
 #define RAW_STREAM_API_SYNTAX STREAM_API_SYNTAX_BODY("uuid_raw_audio_stream")
@@ -293,7 +294,8 @@ typedef enum {
     STREAM_CMD_PAUSE,
     STREAM_CMD_RESUME,
     STREAM_CMD_MUTE,
-    STREAM_CMD_UNMUTE
+    STREAM_CMD_UNMUTE,
+    STREAM_CMD_LIST
 } stream_command_t;
 
 static stream_command_t stream_command_from_string(const char *name) {
@@ -320,6 +322,9 @@ static stream_command_t stream_command_from_string(const char *name) {
     }
     if (!strcasecmp(name, "unmute")) {
         return STREAM_CMD_UNMUTE;
+    }
+    if (!strcasecmp(name, "list")) {
+        return STREAM_CMD_LIST;
     }
     return STREAM_CMD_UNKNOWN;
 }
@@ -466,6 +471,7 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
     char bug_name[MAX_BUG_NAME];
     unsigned int argc = 0;
     void *lifecycle_guard = NULL;
+    char *result_json = NULL;
     stream_error_t error = {0};
     switch_bool_t stream_selected = SWITCH_FALSE;
 
@@ -515,8 +521,8 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
         switch_snprintf(bug_name, sizeof(bug_name), MY_BUG_NAME ":%s", stream_name);
     }
 
-    stream_selected = SWITCH_TRUE;
     stream_command_t command = stream_command_from_string(argv[1]);
+    stream_selected = command != STREAM_CMD_LIST || has_selector;
 
     switch_core_session_t *lsession = switch_core_session_locate(argv[0]);
     if (lsession) {
@@ -537,6 +543,13 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
         }
 
         switch (command) {
+            case STREAM_CMD_LIST:
+                if (argc != 2) {
+                    stream_fail(&error, "List accepts only an optional stream selector");
+                    goto release_session;
+                }
+                status = stream_session_list(lsession, has_selector ? bug_name : NULL, &result_json, &error);
+                break;
             case STREAM_CMD_STOP:
                 if (argc > 3) {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
@@ -590,7 +603,8 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
             default:
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
                                   "unsupported mod_openai_audio_stream cmd: %s\n", argv[1]);
-                stream_fail(&error, "Unknown command; expected start, stop, pause, resume, mute, unmute or send_json");
+                stream_fail(&error,
+                            "Unknown command; expected start, stop, pause, resume, mute, unmute, send_json or list");
                 break;
         }
 
@@ -605,7 +619,7 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
 
 respond:
     if (status == SWITCH_STATUS_SUCCESS) {
-        stream->write_function(stream, "+OK Success\n");
+        stream->write_function(stream, "+OK %s\n", result_json ? result_json : "Success");
     } else if (stream_selected) {
         stream->write_function(stream, "-ERR %s [stream=%s]\n", error.message[0] ? error.message : "Operation failed",
                                stream_name);
@@ -614,6 +628,7 @@ respond:
     }
 
 done:
+    switch_safe_free(result_json);
     switch_safe_free(mycmd);
     return SWITCH_STATUS_SUCCESS;
 }
@@ -660,6 +675,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_openai_audio_stream_load) {
     switch_console_set_complete("add uuid_openai_audio_stream ::console::list_uuid mute");
     switch_console_set_complete("add uuid_openai_audio_stream ::console::list_uuid unmute");
     switch_console_set_complete("add uuid_openai_audio_stream ::console::list_uuid send_json");
+    switch_console_set_complete("add uuid_openai_audio_stream ::console::list_uuid list");
     switch_console_set_complete("add uuid_raw_audio_stream ::console::list_uuid start ws-uri");
     switch_console_set_complete("add uuid_raw_audio_stream ::console::list_uuid stop");
     switch_console_set_complete("add uuid_raw_audio_stream ::console::list_uuid pause");
@@ -667,6 +683,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_openai_audio_stream_load) {
     switch_console_set_complete("add uuid_raw_audio_stream ::console::list_uuid mute");
     switch_console_set_complete("add uuid_raw_audio_stream ::console::list_uuid unmute");
     switch_console_set_complete("add uuid_raw_audio_stream ::console::list_uuid send_json");
+    switch_console_set_complete("add uuid_raw_audio_stream ::console::list_uuid list");
 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_openai_audio_stream API successfully loaded\n");
 

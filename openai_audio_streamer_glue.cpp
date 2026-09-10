@@ -969,6 +969,21 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
         return SWITCH_STATUS_FALSE;
     }
 
+    // API lifecycle serialization makes the first registry creation exclusive. It survives all streams.
+    switch_channel_t *channel = switch_core_session_get_channel(session);
+    auto *registry = static_cast<stream_registry_t *>(switch_channel_get_private(channel, STREAM_REGISTRY));
+    if (!registry) {
+        registry = static_cast<stream_registry_t *>(switch_core_session_alloc(session, sizeof(stream_registry_t)));
+        registry->head = nullptr;
+        if (switch_mutex_init(&registry->mutex, SWITCH_MUTEX_NESTED, pool) != SWITCH_STATUS_SUCCESS) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "Error creating stream registry mutex.\n");
+            return SWITCH_STATUS_FALSE;
+        }
+        switch_channel_set_private(channel, STREAM_REGISTRY, registry);
+    }
+    tech_pvt->registry = registry;
+
     if (config.send_audio && switch_buffer_create(pool, &tech_pvt->sbuffer, buflen) != SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "%s: Error creating switch buffer.\n",
                           tech_pvt->sessionId);
@@ -1122,6 +1137,53 @@ void stream_session_lifecycle_unlock(void *handle) {
 
 int validate_ws_uri(const char *url, char *wsUri) {
     return stream_protocol::validate_ws_uri(url, wsUri, MAX_WS_URI) ? 1 : 0;
+}
+
+switch_status_t stream_session_list(switch_core_session_t *session, const char *bug_name, char **json,
+                                    stream_error_t *error) {
+    *json = nullptr;
+    switch_stream_handle_t result;
+    SWITCH_STANDARD_STREAM(result);
+    switch_status_t status = result.write_function(&result, "[");
+    bool found = false;
+    switch_channel_t *channel = switch_core_session_get_channel(session);
+    auto *registry = static_cast<stream_registry_t *>(switch_channel_get_private(channel, STREAM_REGISTRY));
+    if (registry) {
+        // CLOSE unlinks under this mutex before destroying the streamer. Never take a context mutex here.
+        switch_mutex_lock(registry->mutex);
+        for (private_t *data = registry->head; data && status == SWITCH_STATUS_SUCCESS; data = data->next_stream) {
+            if (bug_name && strcmp(data->bug_name, bug_name) != 0) {
+                continue;
+            }
+            const char *name =
+                strcmp(data->bug_name, MY_BUG_NAME) == 0 ? STREAM_DEFAULT_NAME : data->bug_name + sizeof(MY_BUG_NAME);
+            const char *direction = data->send_audio ? (data->receive_audio ? "both" : "send") : "recv";
+            // Names are validated ASCII identifiers; all other values are fixed strings or booleans.
+            status = result.write_function(
+                &result,
+                "%s{\"name\":\"%s\",\"direction\":\"%s\",\"connected\":%s,\"paused\":%s,"
+                "\"send_muted\":%s,\"recv_muted\":%s}",
+                found ? "," : "", name, direction, audio_streamer(data)->isConnected() ? "true" : "false",
+                switch_atomic_read(&data->audio_paused) ? "true" : "false",
+                data->send_audio && switch_atomic_read(&data->user_audio_muted) ? "true" : "false",
+                data->receive_audio && switch_atomic_read(&data->openai_audio_muted) ? "true" : "false");
+            found = true;
+        }
+        switch_mutex_unlock(registry->mutex);
+    }
+    if (status == SWITCH_STATUS_SUCCESS && bug_name && !found) {
+        switch_safe_free(result.data);
+        return stream_fail(error, "Stream not found");
+    }
+    if (status == SWITCH_STATUS_SUCCESS) {
+        status = result.write_function(&result, "]");
+    }
+    if (status != SWITCH_STATUS_SUCCESS) {
+        switch_safe_free(result.data);
+        return stream_fail(error, "Failed to build stream list");
+    }
+    *json = static_cast<char *>(result.data);
+    return SWITCH_STATUS_SUCCESS;
 }
 
 // C API commands take the session and stream key before the payload.
@@ -1492,7 +1554,15 @@ switch_status_t stream_session_start(void *pUserData) {
     }
     auto *tech_pvt = static_cast<private_t *>(pUserData);
     AudioStreamer *streamer = audio_streamer(tech_pvt);
-    return streamer && streamer->start() ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+    if (!streamer) {
+        return SWITCH_STATUS_FALSE;
+    }
+    // The caller holds this new context's mutex and has already attached its media bug.
+    switch_mutex_lock(tech_pvt->registry->mutex);
+    tech_pvt->next_stream = tech_pvt->registry->head;
+    tech_pvt->registry->head = tech_pvt;
+    switch_mutex_unlock(tech_pvt->registry->mutex);
+    return streamer->start() ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
 }
 
 switch_bool_t stream_frame(switch_media_bug_t *bug) {
@@ -1776,6 +1846,17 @@ void stream_session_close(switch_core_session_t *session, void *user_data) {
     if (switch_channel_get_private(channel, STREAM_PLAYBACK_OWNER) == tech_pvt) {
         switch_channel_set_private(channel, STREAM_PLAYBACK_OWNER, nullptr);
     }
+    // Finish any list read before destroying callback-visible C++ state.
+    switch_mutex_lock(tech_pvt->registry->mutex);
+    private_t **entry = &tech_pvt->registry->head;
+    while (*entry && *entry != tech_pvt) {
+        entry = &(*entry)->next_stream;
+    }
+    if (*entry) {
+        *entry = tech_pvt->next_stream;
+    }
+    tech_pvt->next_stream = nullptr;
+    switch_mutex_unlock(tech_pvt->registry->mutex);
     tech_pvt->bug = nullptr;
     destroy_tech_pvt(tech_pvt);
     switch_mutex_unlock(tech_pvt->mutex);

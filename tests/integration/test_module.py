@@ -292,6 +292,11 @@ class ModuleIntegrationBase(unittest.TestCase):
         disconnected = wait_for_event(lambda event: event.get("event") == "disconnected", before)
         self.assertIsNotNone(disconnected, "WebSocket did not disconnect after stop")
 
+    def list_streams(self, stream=None, stream_api="uuid_openai_audio_stream"):
+        selector = f" stream={stream}" if stream is not None else ""
+        result = assert_ok(self, f"{stream_api} {self.uuid} list{selector}")
+        return json.loads(result.removeprefix("+OK "))
+
     def restart_after_automatic_cleanup(self, timeout=5):
         deadline = time.monotonic() + timeout
         last_bug_list = "no media-bug query completed"

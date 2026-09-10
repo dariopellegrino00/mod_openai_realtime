@@ -49,7 +49,7 @@ class MockRealtimeServer:
                 body,
             )
         if (
-            path in {"/gated-reconnect", "/gated-initial-connect", "/gated-api-errors"}
+            path in {"/gated-reconnect", "/gated-initial-connect", "/gated-api-errors", "/gated-stream-list"}
             and handshake_number > 1
             and not self.reconnect_gate.exists()
         ):
@@ -108,6 +108,7 @@ class MockRealtimeServer:
                         "/close-on-command",
                         "/gated-reconnect",
                         "/gated-api-errors",
+                        "/gated-stream-list",
                         "/rejected-messages",
                         "/reconnect-during-playback",
                         "/terminal-close-during-playback",

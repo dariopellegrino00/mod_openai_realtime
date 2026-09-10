@@ -382,6 +382,7 @@ class StreamInstancesTest(ModuleIntegrationBase):
                     f"send_json {encode_json({'type': 'integration.close'})}",
                 )
                 self.assertTrue(wait_until(lambda: "audio_stream:temporary" not in api(f"uuid_buglist {self.uuid}")))
+                self.assertEqual([item["name"] for item in self.list_streams()], ["survivor"])
                 self.assert_capture("/survivor", len(mock_events()))
                 self.start_stream(stream="temporary", direction=direction)
                 self.stop_stream(stream="temporary")
@@ -394,6 +395,7 @@ class StreamInstancesTest(ModuleIntegrationBase):
             self.command("speaker", "start ws://127.0.0.1:1 recv")
             self.wait_for_stream_event(socket, CONNECTION_ERROR_EVENT, "speaker")
             self.assertTrue(wait_until(lambda: "audio_stream:speaker" not in api(f"uuid_buglist {self.uuid}")))
+            self.assertEqual([item["name"] for item in self.list_streams()], ["observer"])
         self.start_stream(stream="speaker", direction="recv")
         self.command("observer", "resume")
         self.stop_stream(stream="speaker")

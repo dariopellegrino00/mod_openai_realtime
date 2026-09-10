@@ -234,6 +234,7 @@ A compliant custom backend using raw audio mode must:
 Use `stream=<name>` to select an instance on the channel. Names contain 1–64 lowercase ASCII letters, digits,
 underscores or hyphens. Omitting the selector addresses `default`; `stream=default` is an explicit alias for the
 same instance. Names are shared by both API families and can be reused after the stream stops.
+The `list` command is the exception: without a selector it lists all streams on the channel.
 
 The optional start argument `send`, `recv` or `both` selects the audio direction, from FreeSWITCH's perspective:
 
@@ -356,9 +357,30 @@ uuid_openai_audio_stream <uuid> unmute [send | recv | all] [stream=<name>]
 ```
 Re-enables the selected audio direction after a corresponding `mute`. The legacy targets `user`, `openai` and `both` remain aliases for `send`, `recv` and `all` on both commands. Defaults to `send` (`user`) when omitted.
 
+```text
+uuid_openai_audio_stream <uuid> list [stream=<name>]
+uuid_raw_audio_stream <uuid> list [stream=<name>]
+```
+
+Lists the module's active streams on this channel, regardless of which API started them. With `stream=<name>`,
+returns only that stream, or `-ERR Stream not found` if it is absent. Without a selector, an empty channel returns
+`+OK []`. Other modules' media bugs are excluded.
+
+The response is `+OK` followed by a JSON array, for example:
+
+```text
++OK [{"name":"bot","direction":"both","connected":true,"paused":false,"send_muted":false,"recv_muted":false}]
+```
+
+`connected` reports whether the WebSocket is open. `paused`, `send_muted` and `recv_muted` report the stream's
+control state; a disabled direction always has its mute field set to `false`. Pause and mute do not change
+`direction` or release playback ownership. These values are a snapshot and may change immediately after the
+command. Array order is unspecified. Connection URIs, headers, credentials and payloads are not included.
+
 ### Command responses
 
-Successful commands retain the response `+OK Success`. Failures return one `-ERR` line with a reason and, once
+Successful start and control commands retain the response `+OK Success`; `list` returns `+OK` followed by its JSON array.
+Failures return one `-ERR` line with a reason and, once
 validated, the selected stream name. A playback conflict also identifies the stream that owns playback:
 
 ```text

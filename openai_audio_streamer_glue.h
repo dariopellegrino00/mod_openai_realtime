@@ -20,6 +20,9 @@ static inline switch_status_t stream_fail(stream_error_t *error, const char *mes
 }
 
 int validate_ws_uri(const char *url, char *wsUri);
+/* A null bug_name lists every stream. The caller frees the returned JSON string. */
+switch_status_t stream_session_list(switch_core_session_t *session, const char *bug_name, char **json,
+                                    stream_error_t *error);
 switch_status_t stream_session_send_json(switch_core_session_t *session, const char *bug_name, const char *json,
                                          stream_error_t *error);
 switch_status_t stream_session_pauseresume(switch_core_session_t *session, const char *bug_name, int pause,
