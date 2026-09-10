@@ -64,7 +64,10 @@ Calls use FreeSWITCH's `null/` endpoint. Assertions inspect APIs, ESL events, ba
 recordings to cover JSON/raw transport, playback/resampling, interruptions, pause/mute, stereo capture,
 reconnects, API errors, invalid input, headers, and logging. Lifecycle tests cover overlapping stop/hangup,
 unload refusal with active streams, and unload/reload after stop. A test-only preload probe controls race timing;
-it is not shipped with the module.
+it is not shipped with the module. Lifecycle checks exercise both default and named streams.
+
+Named-stream tests in `integration/test_stream_instances.py` cover three simultaneous backends, per-stream
+controls/settings/events/files, disabled audio directions, playback ownership, and isolated close/hangup.
 
 ASan/UBSan cover the module and its compiled IXWebSocket code, not all of FreeSWITCH or SpeexDSP. LeakSanitizer
 is disabled inside FreeSWITCH; TSan is not run. The suite does not certify real OpenAI behavior, SIP/RTP networking,

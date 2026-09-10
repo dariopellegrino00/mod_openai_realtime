@@ -42,7 +42,7 @@ switch_status_t switch_core_media_bug_remove_all_function(switch_core_session_t 
     remove_all_fn real_remove = (remove_all_fn)dlsym(RTLD_NEXT, "switch_core_media_bug_remove_all_function");
     switch_assert(real_remove);
     /* Keep in sync with MY_BUG_NAME in mod_openai_audio_stream.h. */
-    if (function && strcmp(function, "audio_stream") == 0) {
+    if (function && (strcmp(function, "audio_stream") == 0 || strncmp(function, "audio_stream:", 13) == 0)) {
         wait_before_remove();
     }
     return real_remove(session, function);

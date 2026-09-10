@@ -24,13 +24,13 @@ static void free_event_subclasses(void) {
     switch_event_free_subclass(EVENT_OPENAI_SPEECH_STOPPED);
 }
 
-static switch_bool_t suppress_sensitive_logs(switch_core_session_t *session) {
+static switch_bool_t suppress_sensitive_logs(switch_core_session_t *session, const char *bug_name) {
     if (!session) {
         return SWITCH_FALSE;
     }
 
     switch_channel_t *channel = switch_core_session_get_channel(session);
-    private_t *tech_pvt = channel ? switch_channel_get_private(channel, MY_BUG_NAME) : NULL;
+    private_t *tech_pvt = channel ? switch_channel_get_private(channel, bug_name) : NULL;
 
     if (tech_pvt) {
         return tech_pvt->suppress_log;
@@ -40,7 +40,8 @@ static switch_bool_t suppress_sensitive_logs(switch_core_session_t *session) {
 
 /* The responseHandler_t callback signature fixes the order of these string parameters. */
 /* NOLINTNEXTLINE(bugprone-easily-swappable-parameters) */
-static void responseHandler(switch_core_session_t *session, const char *eventName, const char *json) {
+static void responseHandler(switch_core_session_t *session, const char *stream_name, const char *eventName,
+                            const char *json) {
     switch_event_t *event;
     switch_channel_t *channel = switch_core_session_get_channel(session);
     if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, eventName) != SWITCH_STATUS_SUCCESS) {
@@ -49,6 +50,7 @@ static void responseHandler(switch_core_session_t *session, const char *eventNam
         return;
     }
     switch_channel_event_set_data(channel, event);
+    switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Stream-Name", stream_name);
     if (json)
         switch_event_add_body(event, "%s", json);
     switch_event_fire(&event);
@@ -73,6 +75,8 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
                 return SWITCH_FALSE;
             }
             return stream_frame(bug);
+        case SWITCH_ABC_TYPE_READ_PING:
+            return switch_atomic_read(&tech_pvt->close_requested) ? SWITCH_FALSE : SWITCH_TRUE;
         case SWITCH_ABC_TYPE_WRITE_REPLACE:
             if (switch_atomic_read(&tech_pvt->close_requested)) {
                 return SWITCH_FALSE;
@@ -108,20 +112,31 @@ static int parse_sampling_rate(const char *str) {
     return (int)value;
 }
 
-static switch_status_t start_capture(switch_core_session_t *session, switch_media_bug_flag_t flags, char *wsUri,
-                                     int sampling, int playback_sampling, switch_bool_t start_muted,
-                                     switch_bool_t force_raw_audio_mode, stream_error_t *error) {
+static switch_status_t start_capture(switch_core_session_t *session, switch_media_bug_flag_t flags,
+                                     const stream_start_options_t *options, stream_error_t *error) {
     switch_channel_t *channel = switch_core_session_get_channel(session);
     switch_media_bug_t *bug;
     switch_status_t status;
     switch_codec_t *read_codec;
 
     void *pUserData = NULL;
-
-    if (switch_channel_get_private(channel, MY_BUG_NAME)) {
+    if (switch_channel_get_private(channel, options->bug_name)) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "mod_openai_audio_stream: bug already attached!\n");
         return stream_fail(error, "Stream already exists");
+    }
+
+    private_t *playback_owner = switch_channel_get_private(channel, STREAM_PLAYBACK_OWNER);
+    if (options->receive_audio && playback_owner) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                          "channel already has a stream with playback enabled\n");
+        const char *owner_name = strcmp(playback_owner->bug_name, MY_BUG_NAME) == 0
+                                     ? STREAM_DEFAULT_NAME
+                                     : playback_owner->bug_name + sizeof(MY_BUG_NAME);
+        /* The owner and its name remain valid in the session pool while CLOSE releases the slot. */
+        switch_snprintf(error->message, sizeof(error->message), "Playback is already enabled by stream '%s'",
+                        owner_name);
+        return SWITCH_STATUS_FALSE;
     }
 
     if (switch_channel_pre_answer(channel) != SWITCH_STATUS_SUCCESS) {
@@ -138,16 +153,9 @@ static switch_status_t start_capture(switch_core_session_t *session, switch_medi
         return stream_fail(error, "Channel has no read codec ready");
     }
 
-    const stream_start_options_t options = {
-        .websocket_uri = wsUri,
-        .capture_input_rate = read_codec->implementation->actual_samples_per_second,
-        .capture_output_rate = sampling,
-        .playback_input_rate = playback_sampling,
-        .channels = (flags & SMBF_STEREO) ? 2 : 1,
-        .start_muted = start_muted,
-        .force_raw_audio_mode = force_raw_audio_mode,
-    };
-    if (SWITCH_STATUS_FALSE == stream_session_init(session, responseHandler, &options, &pUserData, error)) {
+    if (SWITCH_STATUS_FALSE == stream_session_init(session, responseHandler,
+                                                   read_codec->implementation->actual_samples_per_second, options,
+                                                   &pUserData, error)) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "Error initializing mod_openai_audio_stream session.\n");
         if (!error || !error->message[0]) {
@@ -158,7 +166,7 @@ static switch_status_t start_capture(switch_core_session_t *session, switch_medi
     private_t *tech_pvt = (private_t *)pUserData;
     /* CLOSE may run as soon as add publishes the bug. Keep its context alive until startup completes. */
     switch_mutex_lock(tech_pvt->mutex);
-    if (switch_core_media_bug_add(session, MY_BUG_NAME, NULL, capture_callback, pUserData, 0, flags, &bug) !=
+    if (switch_core_media_bug_add(session, options->bug_name, NULL, capture_callback, pUserData, 0, flags, &bug) !=
         SWITCH_STATUS_SUCCESS) {
         switch_mutex_unlock(tech_pvt->mutex);
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error adding media bug.\n");
@@ -166,22 +174,26 @@ static switch_status_t start_capture(switch_core_session_t *session, switch_medi
         return stream_fail(error, "Failed to attach stream to channel");
     }
     tech_pvt->bug = bug;
-    switch_channel_set_private(channel, MY_BUG_NAME, tech_pvt);
+    switch_channel_set_private(channel, options->bug_name, tech_pvt);
+    if (options->receive_audio) {
+        switch_channel_set_private(channel, STREAM_PLAYBACK_OWNER, tech_pvt);
+    }
 
     status = switch_channel_ready(channel) ? stream_session_start(pUserData) : SWITCH_STATUS_FALSE;
     switch_mutex_unlock(tech_pvt->mutex);
     if (status != SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error starting stream.\n");
-        stream_session_cleanup(session, NULL, NULL);
+        stream_session_cleanup(session, options->bug_name, NULL, NULL);
         return stream_fail(error, "Failed to start stream");
     }
 
     return SWITCH_STATUS_SUCCESS;
 }
 
-static switch_status_t do_stop(switch_core_session_t *session, char *json, stream_error_t *error) {
+static switch_status_t do_stop(switch_core_session_t *session, const char *bug_name, char *json,
+                               stream_error_t *error) {
     if (json) {
-        if (suppress_sensitive_logs(session)) {
+        if (suppress_sensitive_logs(session, bug_name)) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                               "mod_openai_audio_stream: stop w/ final json (payload suppressed)\n");
         } else {
@@ -191,47 +203,57 @@ static switch_status_t do_stop(switch_core_session_t *session, char *json, strea
     } else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_openai_audio_stream: stop\n");
     }
-    return stream_session_cleanup(session, json, error);
+    return stream_session_cleanup(session, bug_name, json, error);
 }
 
-static switch_status_t do_pauseresume(switch_core_session_t *session, int pause, stream_error_t *error) {
+static switch_status_t do_pauseresume(switch_core_session_t *session, const char *bug_name, int pause,
+                                      stream_error_t *error) {
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_openai_audio_stream: %s\n",
                       pause ? "pause" : "resume");
-    return stream_session_pauseresume(session, pause, error);
+    return stream_session_pauseresume(session, bug_name, pause, error);
 }
 
-static switch_status_t do_audio_mute(switch_core_session_t *session, const char *target, int mute,
+static switch_status_t do_audio_mute(switch_core_session_t *session, const char *bug_name, const char *target, int mute,
                                      stream_error_t *error) {
     switch_status_t status = SWITCH_STATUS_FALSE;
-    const char *which = target && *target ? target : "user";
 
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_openai_audio_stream: %s %s audio\n",
-                      mute ? "mute" : "unmute", which);
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                      "mod_openai_audio_stream [%s]: %s %s audio\n", bug_name, mute ? "mute" : "unmute", target);
 
-    if (!strcasecmp(which, "user")) {
-        status = stream_session_set_user_mute(session, mute, error);
-    } else if (!strcasecmp(which, "openai")) {
-        status = stream_session_set_openai_mute(session, mute, error);
-    } else if (!strcasecmp(which, "all") || !strcasecmp(which, "both")) {
-        switch_status_t user_status = stream_session_set_user_mute(session, mute, error);
-        switch_status_t openai_status = stream_session_set_openai_mute(session, mute, error);
+    if (!strcasecmp(target, "user")) {
+        status = stream_session_set_user_mute(session, bug_name, mute, error);
+    } else if (!strcasecmp(target, "openai")) {
+        status = stream_session_set_openai_mute(session, bug_name, mute, error);
+    } else if (!strcasecmp(target, "all") || !strcasecmp(target, "both")) {
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        private_t *tech_pvt = switch_channel_get_private(channel, bug_name);
+        if (!tech_pvt) {
+            return stream_fail(error, "Stream not found");
+        }
+        /* Capabilities are immutable and the context lives in the session pool. */
+        switch_status_t user_status =
+            tech_pvt->send_audio ? stream_session_set_user_mute(session, bug_name, mute, error) : SWITCH_STATUS_SUCCESS;
+        switch_status_t openai_status = tech_pvt->receive_audio
+                                            ? stream_session_set_openai_mute(session, bug_name, mute, error)
+                                            : SWITCH_STATUS_SUCCESS;
         status = (user_status == SWITCH_STATUS_SUCCESS && openai_status == SWITCH_STATUS_SUCCESS)
                      ? SWITCH_STATUS_SUCCESS
                      : SWITCH_STATUS_FALSE;
     } else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                          "mod_openai_audio_stream: invalid mute target '%s', expected user|openai|all\n", which);
+                          "mod_openai_audio_stream: invalid mute target '%s', expected user|openai|all\n", target);
         status = stream_fail(error, "Invalid mute target; expected user, openai or all");
     }
 
     return status;
 }
 
-static switch_status_t send_json(switch_core_session_t *session, char *json, stream_error_t *error) {
+static switch_status_t send_json(switch_core_session_t *session, const char *bug_name, char *json,
+                                 stream_error_t *error) {
     switch_status_t status = SWITCH_STATUS_FALSE;
     switch_channel_t *channel = switch_core_session_get_channel(session);
-    if (switch_channel_get_private(channel, MY_BUG_NAME)) {
-        status = stream_session_send_json(session, json, error);
+    if (switch_channel_get_private(channel, bug_name)) {
+        status = stream_session_send_json(session, bug_name, json, error);
     } else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "mod_openai_audio_stream: no bug, failed sending json\n");
@@ -241,15 +263,16 @@ static switch_status_t send_json(switch_core_session_t *session, char *json, str
 }
 
 #define STREAM_API_SYNTAX_BODY(api_name)                                                                               \
-    "USAGE:\n"                                                                                                         \
-    "--------------------------------------------------------------------------------\n" api_name                      \
-    " <uuid> start <ws-uri> <mono | mixed | stereo>\n"                                                                 \
-    "         [send_rate] [playback_rate] [mute_user]\n"                                                               \
-    "         where <rate> = 8k|16k|24k or a decimal multiple of 8000 up to 48000\n"                                   \
-    "         send_rate default: 24k, playback_rate default: 24k\n" api_name " <uuid> stop [<base64json>]\n" api_name  \
-    " <uuid> [pause | resume]\n" api_name " <uuid> [mute | unmute] [user | openai | all]\n" api_name                   \
-    " <uuid> send_json <base64json>\n"                                                                                 \
-    "--------------------------------------------------------------------------------\n"
+    "USAGE (stream defaults to 'default', direction defaults to both):\n" api_name                                     \
+    " <uuid> start <ws-uri> <mono|mixed|stereo> [send_rate] [playback_rate] [mute_user] [both] "                       \
+    "[stream=<name>]\n" api_name                                                                                       \
+    " <uuid> start <ws-uri> <mono|mixed|stereo> [send_rate] [mute_user] send [stream=<name>]\n" api_name               \
+    " <uuid> start <ws-uri> recv [playback_rate] [stream=<name>]\n"                                                    \
+    "  Rates: 8k|16k|24k or a decimal multiple of 8000 up to 48000; default 24k.\n"                                    \
+    "  Names: 1-64 lowercase letters, digits, '_' or '-'. Only one recv/both stream per channel.\n" api_name           \
+    " <uuid> stop [base64json] [stream=<name>]\n" api_name " <uuid> <pause|resume> [stream=<name>]\n" api_name         \
+    " <uuid> <mute|unmute> [user|openai|all] [stream=<name>]\n" api_name                                               \
+    " <uuid> send_json <base64json> [stream=<name>]\n"
 
 #define STREAM_API_SYNTAX STREAM_API_SYNTAX_BODY("uuid_openai_audio_stream")
 #define RAW_STREAM_API_SYNTAX STREAM_API_SYNTAX_BODY("uuid_raw_audio_stream")
@@ -299,12 +322,150 @@ static stream_command_t stream_command_from_string(const char *name) {
     return STREAM_CMD_UNKNOWN;
 }
 
+/* Lowercase ASCII keeps channel keys and FreeSWITCH's case-insensitive bug lookup consistent. */
+static switch_bool_t valid_stream_name(const char *name) {
+    size_t length = strlen(name);
+    if (!length || length >= MAX_STREAM_NAME) {
+        return SWITCH_FALSE;
+    }
+    for (size_t i = 0; i < length; ++i) {
+        char c = name[i];
+        if (!(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '_' && c != '-') {
+            return SWITCH_FALSE;
+        }
+    }
+    return SWITCH_TRUE;
+}
+
+static void remove_argument(char *argv[], unsigned int *argc, unsigned int index) {
+    for (unsigned int i = index + 1; i < *argc; ++i) {
+        argv[i - 1] = argv[i];
+    }
+    argv[--*argc] = NULL;
+}
+
+static switch_status_t start_stream(switch_core_session_t *session, unsigned int argc, char *argv[],
+                                    stream_start_options_t options, stream_error_t *error) {
+    switch_bool_t suppress_log = suppress_sensitive_logs(session, options.bug_name);
+    options.send_audio = SWITCH_TRUE;
+    options.receive_audio = SWITCH_TRUE;
+    options.channels = 1;
+    switch_bool_t has_direction = SWITCH_FALSE;
+    for (unsigned int i = 3; i < argc;) {
+        if (strcmp(argv[i], "send") != 0 && strcmp(argv[i], "recv") != 0 && strcmp(argv[i], "both") != 0) {
+            ++i;
+            continue;
+        }
+        if (has_direction) {
+            return stream_fail(error, "Specify only one audio direction: send, recv or both");
+        }
+        has_direction = SWITCH_TRUE;
+        options.send_audio = strcmp(argv[i], "recv") ? SWITCH_TRUE : SWITCH_FALSE;
+        options.receive_audio = strcmp(argv[i], "send") ? SWITCH_TRUE : SWITCH_FALSE;
+        remove_argument(argv, &argc, i);
+    }
+    if (argc < (options.send_audio ? 4U : 3U)) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "start requires a websocket URI%s%s\n",
+                          options.send_audio ? " and mix type" : "", suppress_log ? " (arguments suppressed)" : "");
+        return stream_fail(error, options.send_audio
+                                      ? "Start requires a WebSocket URI and mix type (mono, mixed or stereo)"
+                                      : "Start requires a WebSocket URI");
+    }
+    char wsUri[MAX_WS_URI];
+    int sampling = 24000;
+    int playback_sampling = 24000;
+    const char *sampling_str = NULL;
+    const char *playback_sampling_str = NULL;
+    switch_media_bug_flag_t flags = SMBF_ONE_ONLY;
+    unsigned int next_index = 3;
+    if (options.send_audio) {
+        flags |= SMBF_READ_STREAM;
+        if (strcmp(argv[next_index], "mixed") == 0) {
+            flags |= SMBF_WRITE_STREAM;
+        } else if (strcmp(argv[next_index], "stereo") == 0) {
+            flags |= SMBF_WRITE_STREAM;
+            flags |= SMBF_STEREO;
+            options.channels = 2;
+        } else if (strcmp(argv[next_index], "mono") != 0) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "invalid mix type: %s, must be mono, mixed, or stereo\n", argv[next_index]);
+            return stream_fail(error, "Invalid mix type; expected mono, mixed or stereo");
+        }
+        ++next_index;
+        if (next_index < argc && strcasecmp(argv[next_index], "mute_user") != 0) {
+            sampling_str = argv[next_index++];
+            sampling = parse_sampling_rate(sampling_str);
+        }
+    } else {
+        /* A read ping keeps terminal cleanup active without buffering captured audio. */
+        flags |= SMBF_READ_PING;
+    }
+    if (options.receive_audio) {
+        flags |= SMBF_WRITE_REPLACE;
+        if (next_index < argc && strcasecmp(argv[next_index], "mute_user") != 0) {
+            playback_sampling_str = argv[next_index++];
+            playback_sampling = parse_sampling_rate(playback_sampling_str);
+        }
+    }
+    if (options.send_audio && next_index < argc && !strcasecmp(argv[next_index], "mute_user")) {
+        options.start_muted = SWITCH_TRUE;
+        ++next_index;
+    }
+    if (next_index < argc) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "unexpected argument: %s\n",
+                          argv[next_index]);
+        return stream_fail(error, "Unexpected start argument; check rates, direction and mute_user");
+    }
+
+    if (!validate_ws_uri(argv[2], &wsUri[0])) {
+        if (suppress_log) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "invalid websocket uri (details suppressed)\n");
+        } else {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "invalid websocket uri: %s\n",
+                              argv[2]);
+        }
+        return stream_fail(error, "Invalid WebSocket URI; expected ws:// or wss:// with a valid host and port");
+    } else if (sampling < STREAM_MIN_SAMPLING || sampling > STREAM_MAX_SAMPLING || sampling % 8000 != 0) {
+        if (sampling_str) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "invalid send sample rate: %s (must be a multiple of 8000 between %d and "
+                              "%d)\n",
+                              sampling_str, STREAM_MIN_SAMPLING, STREAM_MAX_SAMPLING);
+        } else {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "invalid send sample rate: %d\n",
+                              sampling);
+        }
+        return stream_fail(error, "Invalid send sample rate; expected a multiple of 8000 from 8000 to 48000");
+    } else if (playback_sampling < STREAM_MIN_SAMPLING || playback_sampling > STREAM_MAX_SAMPLING ||
+               playback_sampling % 8000 != 0) {
+        if (playback_sampling_str) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "invalid playback sample rate: %s (must be a multiple of 8000 between %d "
+                              "and %d)\n",
+                              playback_sampling_str, STREAM_MIN_SAMPLING, STREAM_MAX_SAMPLING);
+        } else {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "invalid playback sample rate: %d\n", playback_sampling);
+        }
+        return stream_fail(error, "Invalid playback sample rate; expected a multiple of 8000 from 8000 to 48000");
+    } else {
+        options.ws_uri = wsUri;
+        options.send_rate = sampling;
+        options.playback_rate = playback_sampling;
+        return start_capture(session, flags, &options, error);
+    }
+}
+
 static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch_core_session_t *session,
                                           const char *cmd, const stream_api_config_t *api_config) {
-    char *mycmd = NULL, *argv[8] = {0};
+    char *mycmd = NULL, *argv[16] = {0};
+    const char *stream_name = STREAM_DEFAULT_NAME;
+    char bug_name[MAX_BUG_NAME];
     unsigned int argc = 0;
     void *lifecycle_guard = NULL;
     stream_error_t error = {0};
+    switch_bool_t stream_selected = SWITCH_FALSE;
 
     switch_status_t status = SWITCH_STATUS_FALSE;
 
@@ -330,6 +491,29 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
         goto respond;
     }
 
+    switch_bool_t has_selector = SWITCH_FALSE;
+    for (unsigned int i = 2; i < argc;) {
+        if (strncmp(argv[i], "stream=", 7) != 0) {
+            ++i;
+            continue;
+        }
+        stream_name = argv[i] + 7;
+        if (has_selector || !valid_stream_name(stream_name)) {
+            stream_fail(&error, has_selector
+                                    ? "Specify only one stream selector"
+                                    : "Invalid stream name; expected 1-64 lowercase letters, digits, '_' or '-'");
+            goto respond;
+        }
+        has_selector = SWITCH_TRUE;
+        remove_argument(argv, &argc, i);
+    }
+    if (strcmp(stream_name, STREAM_DEFAULT_NAME) == 0) {
+        switch_copy_string(bug_name, MY_BUG_NAME, sizeof(bug_name));
+    } else {
+        switch_snprintf(bug_name, sizeof(bug_name), MY_BUG_NAME ":%s", stream_name);
+    }
+
+    stream_selected = SWITCH_TRUE;
     stream_command_t command = stream_command_from_string(argv[1]);
 
     switch_core_session_t *lsession = switch_core_session_locate(argv[0]);
@@ -342,11 +526,11 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
             goto release_session;
         }
 
-        switch_bool_t suppress_log = suppress_sensitive_logs(lsession);
+        switch_bool_t suppress_log = suppress_sensitive_logs(lsession, bug_name);
         if (command != STREAM_CMD_SEND_JSON) {
             const char *logged_command = suppress_log ? argv[1] : cmd;
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_DEBUG,
-                              "mod_openai_audio_stream %s cmd: %s%s\n", api_config->api_name,
+                              "mod_openai_audio_stream %s [%s] cmd: %s%s\n", api_config->api_name, stream_name,
                               logged_command ? logged_command : "", suppress_log ? " (arguments suppressed)" : "");
         }
 
@@ -358,17 +542,17 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
                     stream_fail(&error, "Stop accepts at most one Base64 JSON payload");
                     goto release_session;
                 }
-                status = do_stop(lsession, argc > 2 ? argv[2] : NULL, &error);
+                status = do_stop(lsession, bug_name, argc > 2 ? argv[2] : NULL, &error);
                 break;
             case STREAM_CMD_PAUSE:
             case STREAM_CMD_RESUME:
                 if (argc > 2) {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
                                       "%s does not accept arguments\n", argv[1]);
-                    stream_fail(&error, "Pause and resume do not accept arguments");
+                    stream_fail(&error, "Pause and resume accept only an optional stream selector");
                     goto release_session;
                 }
-                status = do_pauseresume(lsession, command == STREAM_CMD_PAUSE ? 1 : 0, &error);
+                status = do_pauseresume(lsession, bug_name, command == STREAM_CMD_PAUSE ? 1 : 0, &error);
                 break;
             case STREAM_CMD_SEND_JSON:
                 if (argc != 3) {
@@ -377,94 +561,14 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
                     stream_fail(&error, "send_json requires exactly one Base64 JSON payload");
                     goto release_session;
                 }
-                status = send_json(lsession, argv[2], &error);
+                status = send_json(lsession, bug_name, argv[2], &error);
                 break;
             case STREAM_CMD_START: {
-                if (argc < 4) {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
-                                      "start requires a websocket URI and mix type%s\n",
-                                      suppress_log ? " (arguments suppressed)" : "");
-                    stream_fail(&error, "Start requires a WebSocket URI and mix type (mono, mixed or stereo)");
-                    goto release_session;
-                }
-                char wsUri[MAX_WS_URI];
-                int sampling = 24000;
-                int playback_sampling = 24000;
-                const char *sampling_str = NULL;
-                const char *playback_sampling_str = NULL;
-                switch_bool_t start_muted = SWITCH_FALSE;
-                switch_media_bug_flag_t flags = SMBF_READ_STREAM;
-                flags |= SMBF_WRITE_REPLACE;
-                flags |= SMBF_ONE_ONLY;
-                if (0 == strcmp(argv[3], "mixed")) {
-                    flags |= SMBF_WRITE_STREAM;
-                } else if (0 == strcmp(argv[3], "stereo")) {
-                    flags |= SMBF_WRITE_STREAM;
-                    flags |= SMBF_STEREO;
-                } else if (0 != strcmp(argv[3], "mono")) {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
-                                      "invalid mix type: %s, must be mono, mixed, or stereo\n", argv[3]);
-                    stream_fail(&error, "Invalid mix type; expected mono, mixed or stereo");
-                    goto release_session;
-                }
-                unsigned int next_index = 4;
-                if (next_index < argc && strcasecmp(argv[next_index], "mute_user") != 0) {
-                    sampling_str = argv[next_index];
-                    sampling = parse_sampling_rate(sampling_str);
-                    next_index++;
-                    if (next_index < argc && strcasecmp(argv[next_index], "mute_user") != 0) {
-                        playback_sampling_str = argv[next_index];
-                        playback_sampling = parse_sampling_rate(playback_sampling_str);
-                        next_index++;
-                    }
-                }
-                if (next_index < argc && !strcasecmp(argv[next_index], "mute_user")) {
-                    start_muted = SWITCH_TRUE;
-                    next_index++;
-                }
-                if (next_index < argc) {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
-                                      "unexpected argument: %s\n", argv[next_index]);
-                    stream_fail(&error, "Unexpected start argument; check rates and mute_user");
-                    goto release_session;
-                }
-
-                if (!validate_ws_uri(argv[2], &wsUri[0])) {
-                    if (suppress_log) {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
-                                          "invalid websocket uri (details suppressed)\n");
-                    } else {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
-                                          "invalid websocket uri: %s\n", argv[2]);
-                    }
-                    stream_fail(&error, "Invalid WebSocket URI; expected ws:// or wss:// with a valid host and port");
-                } else if (sampling < STREAM_MIN_SAMPLING || sampling > STREAM_MAX_SAMPLING || sampling % 8000 != 0) {
-                    if (sampling_str) {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
-                                          "invalid send sample rate: %s (must be a multiple of 8000 between %d and "
-                                          "%d)\n",
-                                          sampling_str, STREAM_MIN_SAMPLING, STREAM_MAX_SAMPLING);
-                    } else {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
-                                          "invalid send sample rate: %d\n", sampling);
-                    }
-                    stream_fail(&error, "Invalid send sample rate; expected a multiple of 8000 from 8000 to 48000");
-                } else if (playback_sampling < STREAM_MIN_SAMPLING || playback_sampling > STREAM_MAX_SAMPLING ||
-                           playback_sampling % 8000 != 0) {
-                    if (playback_sampling_str) {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
-                                          "invalid playback sample rate: %s (must be a multiple of 8000 between %d "
-                                          "and %d)\n",
-                                          playback_sampling_str, STREAM_MIN_SAMPLING, STREAM_MAX_SAMPLING);
-                    } else {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
-                                          "invalid playback sample rate: %d\n", playback_sampling);
-                    }
-                    stream_fail(&error, "Invalid playback sample rate; expected a multiple of 8000 from 8000 to 48000");
-                } else {
-                    status = start_capture(lsession, flags, wsUri, sampling, playback_sampling, start_muted,
-                                           api_config->force_raw_audio_mode, &error);
-                }
+                stream_start_options_t options = {0};
+                options.name = stream_name;
+                options.bug_name = bug_name;
+                options.raw_audio = api_config->force_raw_audio_mode;
+                status = start_stream(lsession, argc, argv, options, &error);
                 break;
             }
             case STREAM_CMD_MUTE:
@@ -476,7 +580,7 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
                     goto release_session;
                 }
                 const char *target = (argc > 2) ? argv[2] : "user";
-                status = do_audio_mute(lsession, target, command == STREAM_CMD_MUTE ? 1 : 0, &error);
+                status = do_audio_mute(lsession, bug_name, target, command == STREAM_CMD_MUTE ? 1 : 0, &error);
                 break;
             }
             case STREAM_CMD_UNKNOWN:
@@ -499,6 +603,9 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
 respond:
     if (status == SWITCH_STATUS_SUCCESS) {
         stream->write_function(stream, "+OK Success\n");
+    } else if (stream_selected) {
+        stream->write_function(stream, "-ERR %s [stream=%s]\n", error.message[0] ? error.message : "Operation failed",
+                               stream_name);
     } else {
         stream->write_function(stream, "-ERR %s\n", error.message[0] ? error.message : "Operation failed");
     }

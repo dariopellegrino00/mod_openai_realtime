@@ -5,7 +5,7 @@
 ![Code-Checks](https://github.com/VoiSmart/mod_openai_realtime/actions/workflows/code-checks.yml/badge.svg?branch=main)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat)](LICENSE)
 
-**mod_openai_realtime** streams PCM16 audio bidirectionally between a FreeSWITCH channel and an OpenAI Realtime or compatible WebSocket endpoint.
+**mod_openai_realtime** streams PCM16 audio between a FreeSWITCH channel and one or more OpenAI Realtime or compatible WebSocket endpoints.
 
 > [!WARNING]
 > This is a standalone fork of `mod_audio_stream`, not affiliated with the original project.
@@ -113,7 +113,10 @@ This supports function calls, instruction updates, and other interactions with O
 
 ### Channel variables
 
-The following channel variables configure the WebSocket connection and module logging:
+The following channel variables configure the WebSocket connection and module logging. Each stream snapshots them
+when it starts, including the values used on reconnect. To use different credentials or settings, set the variables
+before each start; changing them does not reconfigure existing streams. Serialize variable updates and starts in your
+controller when creating streams with different settings on the same channel.
 
 | Variable                               | Description                                             | Default |
 | -------------------------------------- | ------------------------------------------------------- | ------- |
@@ -196,7 +199,8 @@ Because text frames continue to be processed through the normal `processMessage(
 Without these text events, the related features will not work correctly. In particular, without `response.output_audio.done`, the `mod_openai_audio_stream::openai_speech_stop` event will not fire after playback completes.
 
 All JSON text events, including the control events above, continue to be forwarded as
-`mod_openai_audio_stream::json` events unless they contain a valid audio delta consumed for playback.
+`mod_openai_audio_stream::json` events unless they contain a valid audio delta consumed for playback. A `send` stream
+discards incoming audio deltas and binary audio without decoding, playback, debug files, or forwarding audio payloads to ESL.
 
 ### Dialplan Example
 
@@ -225,13 +229,61 @@ A compliant custom backend using raw audio mode must:
 
 ## API
 
+### Multiple streams on one channel
+
+Use `stream=<name>` to select an instance on the channel. Names contain 1–64 lowercase ASCII letters, digits,
+underscores or hyphens. Omitting the selector addresses `default`; `stream=default` is an explicit alias for the
+same instance. Names are shared by both API families and can be reused after the stream stops.
+
+The optional start argument `send`, `recv` or `both` selects the audio direction, from FreeSWITCH's perspective:
+
+| Direction | Channel audio → backend | Backend audio → channel |
+| --- | --- | --- |
+| `send` | Yes | Discarded |
+| `recv` | Disabled | Yes |
+| `both` (default) | Yes | Yes |
+
+Choose one direction. JSON control messages and `send_json` remain available in every mode. Direction controls
+module-managed audio; `send_json` forwards any valid JSON, including manually supplied audio messages.
+Capture selection (`mono`, `mixed`, `stereo`) is independent of direction and is required for `send` and `both`.
+A `recv` start takes only an optional playback rate, with no capture parameters.
+
+A channel can have multiple `send` streams and **one playback-capable stream** (`recv` or `both`). Starting another
+playback-capable stream returns `-ERR`, including while the existing receiver is paused or muted. Stop it to release
+the playback slot. The module replaces channel playback frames; it does not mix multiple backend voices.
+
+For example, one voice bot plus independent transcription and analysis backends on the same leg:
+
+```text
+uuid_openai_audio_stream <uuid> start wss://bot.example/realtime mono stream=bot
+uuid_openai_audio_stream <uuid> start wss://transcription.example/realtime mono send stream=transcription
+uuid_openai_audio_stream <uuid> start wss://analysis.example/realtime mixed send stream=analysis
+uuid_openai_audio_stream <uuid> pause stream=analysis
+uuid_openai_audio_stream <uuid> stop stream=transcription
+```
+
+For separate capture and playback services:
+
+```text
+uuid_openai_audio_stream <uuid> start wss://capture.example/realtime stereo 16k send stream=capture
+uuid_openai_audio_stream <uuid> start wss://speech.example/realtime recv 24k stream=speaker
+```
+
+Every control command acts only on the selected stream. Pause and mute cannot enable a direction disabled at start;
+`mute all` and `unmute all` affect the stream's enabled directions. Explicitly muting or unmuting a disabled direction
+returns `-ERR`. Barge-in, reconnection and terminal close affect only that instance. Hangup closes all streams.
+Each instance uses its own WebSocket thread, capture buffers and playback state; resource use grows with stream count.
+
 ### Commands
 
 The FreeSWITCH module exposes the following API commands:
 
 ```text
-uuid_openai_audio_stream <uuid> start <ws-uri> <mix-type> [<send-rate>] [<playback-rate>] [mute_user]
+uuid_openai_audio_stream <uuid> start <ws-uri> <mix-type> [<send-rate>] [<playback-rate>] [mute_user] [both] [stream=<name>]
 ```
+This is the default bidirectional form. For capture only, use `<mix-type> [<send-rate>] [mute_user] send`;
+for playback only, use `recv [<playback-rate>]`. Append `[stream=<name>]` to either form.
+
 Attaches a media bug and starts streaming PCM16 audio to the WebSocket server. The default send rate is 24 kHz, matching the OpenAI Realtime API requirement. If `send-rate` differs from the channel codec rate, audio is resampled. Passing `mute_user` delays caller audio until an explicit `unmute`.
 
 - `uuid` - FreeSWITCH channel unique ID
@@ -257,61 +309,62 @@ Attaches a media bug and starts streaming PCM16 audio to the WebSocket server. T
 - See [Raw Audio Mode](#raw-audio-mode) for the backend contract, including required JSON control events such as `response.output_audio.done`.
 
 ```text
-uuid_raw_audio_stream <uuid> start <ws-uri> <mix-type> [<send-rate>] [<playback-rate>] [mute_user]
+uuid_raw_audio_stream <uuid> start <ws-uri> <mix-type> [<send-rate>] [<playback-rate>] [mute_user] [both] [stream=<name>]
 ```
 Uses the same arguments as `uuid_openai_audio_stream ... start ...`, but forces raw PCM16 WebSocket audio framing without requiring the deprecated `STREAM_RAW_AUDIO=true` channel variable. This is the preferred entry point for compliant custom raw-audio backends.
 
 All lifecycle commands (`stop`, `pause`, `resume`, `mute`, `unmute`, and `send_json`) are available on both `uuid_openai_audio_stream` and `uuid_raw_audio_stream`, because `uuid_raw_audio_stream` only changes how `start` selects raw audio mode and does not create a separate control plane. For clarity and consistency, prefer controlling the stream through the same API family used for `start`.
 
 ```text
-uuid_openai_audio_stream <uuid> send_json <base64json>
+uuid_openai_audio_stream <uuid> send_json <base64json> [stream=<name>]
 ```
 Sends one complete, NUL-free UTF-8 JSON value accepted by cJSON to the WebSocket endpoint, without additional
 strict JSON syntax checks. The command requires structurally valid Base64, which protects spaces, newlines, and
 other characters from FreeSWITCH API parsing. The decoded bytes are forwarded unchanged rather than reserialized.
 
 ```text
-uuid_openai_audio_stream <uuid> stop [<base64json>]
+uuid_openai_audio_stream <uuid> stop [<base64json>] [stream=<name>]
 ```
 Stops the stream. The optional payload follows the same validation rules as `send_json` and is sent before the
 WebSocket closes. An invalid final payload is not sent and makes the command return `-ERR`, but teardown still
 completes.
 
 ```text
-uuid_openai_audio_stream <uuid> pause
+uuid_openai_audio_stream <uuid> pause [stream=<name>]
 ```
 Pauses audio streaming in both directions. Caller audio stops flowing to OpenAI and any OpenAI playback currently buffering into the channel is halted until `resume`.
 
 ```text
-uuid_openai_audio_stream <uuid> resume
+uuid_openai_audio_stream <uuid> resume [stream=<name>]
 ```
 Resumes audio streaming in both directions after a `pause`.
 
 ```text
-uuid_openai_audio_stream <uuid> mute [user | openai | all]
+uuid_openai_audio_stream <uuid> mute [user | openai | all] [stream=<name>]
 ```
-Keeps the media bug alive while silencing the selected leg. Defaults to `user` when omitted.
+Keeps the media bug alive while silencing the selected audio direction. Defaults to `user` when omitted.
 
 - `user`: block caller audio being sent to OpenAI.
 - `openai`: block OpenAI playback from reaching the channel.
-- `all` (alias `both`): attempt both mute operations; an error does not undo either operation.
+- `all` (alias `both`): mute every audio direction enabled for this stream; an error does not undo changes already applied.
 
 When `mute` changes caller audio from unmuted to muted, the module flushes buffered caller audio and sends
 a block containing one second of silence if the WebSocket is connected.
 
 ```text
-uuid_openai_audio_stream <uuid> unmute [user | openai | all]
+uuid_openai_audio_stream <uuid> unmute [user | openai | all] [stream=<name>]
 ```
-Re-enables the selected audio leg after a corresponding `mute`. Defaults to `user` when omitted.
+Re-enables the selected audio direction after a corresponding `mute`. Defaults to `user` when omitted.
 
 ### Command responses
 
-Successful commands retain the response `+OK Success`. Failures return one `-ERR` line with a reason:
+Successful commands retain the response `+OK Success`. Failures return one `-ERR` line with a reason and, once
+validated, the selected stream name. A playback conflict also identifies the stream that owns playback:
 
 ```text
--ERR Stream not found
--ERR Stream already exists
--ERR Invalid send sample rate; expected a multiple of 8000 from 8000 to 48000
+-ERR Stream not found [stream=transcription]
+-ERR Playback is already enabled by stream 'bot' [stream=speaker]
+-ERR Invalid send sample rate; expected a multiple of 8000 from 8000 to 48000 [stream=default]
 ```
 
 Check the `+OK` or `-ERR` prefix in clients; diagnostic wording is intended for humans. Error replies do not echo
@@ -323,6 +376,10 @@ payload returns `Stream stopped; final message failed: ...`, while failure to se
 `User audio muted; ...`. In both cases the indicated stop or mute has already taken effect.
 
 ## Events
+
+Every module event includes `Unique-ID` (channel UUID) and `Stream-Name` (instance name, including `default`).
+Filter by both when handling multiple streams on the same channel. Event bodies retain their existing format.
+Named streams include their name in debug WAV filenames; each stream removes its own files on teardown.
 
 The module generates the following event types:
 

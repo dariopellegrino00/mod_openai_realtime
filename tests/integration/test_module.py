@@ -8,6 +8,7 @@ import unittest
 import wave
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from audio import (
     AUDIBLE_SAMPLE_THRESHOLD,
@@ -231,17 +232,32 @@ class ModuleIntegrationBase(unittest.TestCase):
         send_rate="24k",
         playback_rate=None,
         mix_type="mono",
+        stream=None,
+        direction=None,
     ):
         before = len(mock_events())
-        command = f"{stream_api} {self.uuid} start {url} {mix_type} {send_rate}"
+        command = f"{stream_api} {self.uuid} start {url}"
+        if direction != "recv":
+            command += f" {mix_type} {send_rate}"
         if playback_rate is not None:
             command += f" {playback_rate}"
-        if start_muted:
+        if start_muted and direction != "recv":
             command += " mute_user"
+        if direction is not None:
+            command += f" {direction}"
+        if stream is not None:
+            command += f" stream={stream}"
         with FreeSwitchEventSocket(self.uuid) as event_socket:
             assert_ok(self, command)
-            self.assertIsNotNone(event_socket.wait_for(CONNECT_EVENT), "client did not finish connecting")
-        connected = wait_for_event(lambda event: event.get("event") == "connected", before)
+            connected = event_socket.wait_for(
+                CONNECT_EVENT, predicate=lambda event: event.get("Stream-Name") == (stream or "default")
+            )
+            self.assertIsNotNone(connected, "client did not finish connecting")
+        parsed_url = urlsplit(url)
+        path = (parsed_url.path or "/") + (f"?{parsed_url.query}" if parsed_url.query else "")
+        connected = wait_for_event(
+            lambda event: event.get("event") == "connected" and event.get("path") == path, before
+        )
         self.assertIsNotNone(connected, "module did not connect to the mock WebSocket server")
         return connected
 
@@ -257,9 +273,11 @@ class ModuleIntegrationBase(unittest.TestCase):
         self.assertTrue(self.recording.exists(), "FreeSWITCH did not create the playback recording")
         return read_mono_pcm16(self.recording)
 
-    def stop_stream(self, final_payload=None, stream_api="uuid_openai_audio_stream"):
+    def stop_stream(self, final_payload=None, stream_api="uuid_openai_audio_stream", stream=None):
         before = len(mock_events())
         command = f"{stream_api} {self.uuid} stop"
+        if stream is not None:
+            command += f" stream={stream}"
         if final_payload is not None:
             command += f" {encode_json(final_payload)}"
         assert_ok(self, command)
@@ -292,10 +310,12 @@ class ModuleIntegrationBase(unittest.TestCase):
         payload=None,
         stream_api="uuid_openai_audio_stream",
         timeout=5,
+        stream=None,
     ):
         before = len(mock_events())
         request = encode_json(payload if payload is not None else {"type": "response.create"})
-        assert_ok(self, f"{stream_api} {self.uuid} send_json {request}")
+        selector = f" stream={stream}" if stream is not None else ""
+        assert_ok(self, f"{stream_api} {self.uuid} send_json {request}{selector}")
         event = wait_for_event(lambda item: item.get("event") == expected_event, before, timeout=timeout)
         self.assertIsNotNone(event, f"mock did not emit {expected_event}")
         return event
@@ -1043,9 +1063,18 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
         self.stop_stream(stream_api="uuid_raw_audio_stream")
 
     def test_stop_overlaps_hangup(self):
-        self.start_stream()
+        for name in (None, "transcription"):
+            with self.subTest(stream=name):
+                if self.uuid is None:
+                    self.originate_call()
+                    assert_ok(self, f"uuid_setvar {self.uuid} STREAM_OPENAI_API_KEY integration-test-key")
+                self.assert_stop_overlaps_hangup(name)
+
+    def assert_stop_overlaps_hangup(self, stream):
+        self.start_stream(stream=stream)
+        selector = f" stream={stream}" if stream is not None else ""
         before = len(mock_events())
-        with self.hold_stop_before_removal(f"uuid_openai_audio_stream {self.uuid} stop") as markers:
+        with self.hold_stop_before_removal(f"uuid_openai_audio_stream {self.uuid} stop{selector}") as markers:
             assert_ok(self, f"uuid_kill {self.uuid}")
             self.assertTrue(wait_until(markers["close-entered"].exists), "hangup did not enter CLOSE")
         self.assertEqual(api(f"uuid_exists {self.uuid}"), "false")

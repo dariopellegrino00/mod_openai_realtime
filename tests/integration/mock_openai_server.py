@@ -139,7 +139,9 @@ class MockRealtimeServer:
                             ]
                         await self.record("audio-received", **audio_event)
                 else:
-                    await self.record("message", type=message_type, payload=payload)
+                    await self.record(
+                        "message", path=path, connection_number=connection_number, type=message_type, payload=payload
+                    )
 
                 if message_type == "session.update":
                     await websocket.send(json.dumps({"type": "session.updated", "session": payload.get("session", {})}))
