@@ -523,6 +523,9 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
     def test_openai_mute_controls_playback(self):
         self.assert_playback_mute_discards_audio("openai")
 
+    def test_recv_mute_controls_playback(self):
+        self.assert_playback_mute_discards_audio("recv")
+
     def test_playback_emits_speech_lifecycle_events(self):
         with FreeSwitchEventSocket(self.uuid) as event_socket:
             self.start_stream()

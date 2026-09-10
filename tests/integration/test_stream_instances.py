@@ -118,6 +118,36 @@ class StreamInstancesTest(ModuleIntegrationBase):
         self.stop_stream(stream="speaker", final_payload={"type": "integration.final"})
         self.assert_no_capture("/receiver", self.event_start)
 
+    def test_mute_aliases_target_the_same_direction_in_both_apis(self):
+        self.start_read_tone()
+        self.start_stream(f"{MOCK_URL}/observer", stream="observer", direction="send", start_muted=False)
+        self.start_stream(stream="speaker", direction="recv")
+        for stream_api in ("uuid_openai_audio_stream", "uuid_raw_audio_stream"):
+            for target, inverse in (("send", "user"), ("user", "send")):
+                assert_ok(self, f"{stream_api} {self.uuid} mute {target} stream=observer")
+                time.sleep(0.1)  # Drain capture and the one-time mute silence already sent to the socket.
+                before = len(mock_events())
+                time.sleep(0.2)
+                self.assert_no_capture("/observer", before)
+                assert_ok(self, f"{stream_api} {self.uuid} unmute {inverse} stream=observer")
+                self.assert_capture("/observer", len(mock_events()))
+            for target, inverse in (("recv", "openai"), ("openai", "recv")):
+                assert_ok(self, f"{stream_api} {self.uuid} mute {target} stream=speaker")
+                assert_ok(self, f"{stream_api} {self.uuid} unmute {inverse} stream=speaker")
+            self.expect_module_errors("stream has no receive audio capability", "stream has no send audio capability")
+            assert_error(
+                self,
+                f"{stream_api} {self.uuid} mute recv stream=observer",
+                "Receive audio is disabled for this stream [stream=observer]",
+            )
+            assert_error(
+                self,
+                f"{stream_api} {self.uuid} unmute send stream=speaker",
+                "Send audio is disabled for this stream [stream=speaker]",
+            )
+        self.stop_stream(stream="observer")
+        self.stop_stream(stream="speaker")
+
     def test_raw_recv_uses_playback_rate_without_capture_parameters(self):
         stream_api = "uuid_raw_audio_stream"
         with FreeSwitchEventSocket(self.uuid) as socket:

@@ -340,21 +340,21 @@ uuid_openai_audio_stream <uuid> resume [stream=<name>]
 Resumes audio streaming in both directions after a `pause`.
 
 ```text
-uuid_openai_audio_stream <uuid> mute [user | openai | all] [stream=<name>]
+uuid_openai_audio_stream <uuid> mute [send | recv | all] [stream=<name>]
 ```
-Keeps the media bug alive while silencing the selected audio direction. Defaults to `user` when omitted.
+Keeps the media bug alive while silencing the selected audio direction. Defaults to `send` (`user`) when omitted.
 
-- `user`: block caller audio being sent to OpenAI.
-- `openai`: block OpenAI playback from reaching the channel.
+- `send` (alias `user`): block channel audio being sent to the backend.
+- `recv` (alias `openai`): block OpenAI playback from reaching the channel.
 - `all` (alias `both`): mute every audio direction enabled for this stream; an error does not undo changes already applied.
 
 When `mute` changes caller audio from unmuted to muted, the module flushes buffered caller audio and sends
 a block containing one second of silence if the WebSocket is connected.
 
 ```text
-uuid_openai_audio_stream <uuid> unmute [user | openai | all] [stream=<name>]
+uuid_openai_audio_stream <uuid> unmute [send | recv | all] [stream=<name>]
 ```
-Re-enables the selected audio direction after a corresponding `mute`. Defaults to `user` when omitted.
+Re-enables the selected audio direction after a corresponding `mute`. The legacy targets `user`, `openai` and `both` remain aliases for `send`, `recv` and `all` on both commands. Defaults to `send` (`user`) when omitted.
 
 ### Command responses
 

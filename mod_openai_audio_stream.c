@@ -220,9 +220,9 @@ static switch_status_t do_audio_mute(switch_core_session_t *session, const char 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                       "mod_openai_audio_stream [%s]: %s %s audio\n", bug_name, mute ? "mute" : "unmute", target);
 
-    if (!strcasecmp(target, "user")) {
+    if (!strcasecmp(target, "user") || !strcasecmp(target, "send")) {
         status = stream_session_set_user_mute(session, bug_name, mute, error);
-    } else if (!strcasecmp(target, "openai")) {
+    } else if (!strcasecmp(target, "openai") || !strcasecmp(target, "recv")) {
         status = stream_session_set_openai_mute(session, bug_name, mute, error);
     } else if (!strcasecmp(target, "all") || !strcasecmp(target, "both")) {
         switch_channel_t *channel = switch_core_session_get_channel(session);
@@ -240,9 +240,10 @@ static switch_status_t do_audio_mute(switch_core_session_t *session, const char 
                      ? SWITCH_STATUS_SUCCESS
                      : SWITCH_STATUS_FALSE;
     } else {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                          "mod_openai_audio_stream: invalid mute target '%s', expected user|openai|all\n", target);
-        status = stream_fail(error, "Invalid mute target; expected user, openai or all");
+        switch_log_printf(
+            SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+            "mod_openai_audio_stream: invalid mute target '%s', expected send|recv|all (user|openai|both)\n", target);
+        status = stream_fail(error, "Invalid mute target; expected send (user), recv (openai) or all (both)");
     }
 
     return status;
@@ -271,7 +272,8 @@ static switch_status_t send_json(switch_core_session_t *session, const char *bug
     "  Rates: 8k|16k|24k or a decimal multiple of 8000 up to 48000; default 24k.\n"                                    \
     "  Names: 1-64 lowercase letters, digits, '_' or '-'. Only one recv/both stream per channel.\n" api_name           \
     " <uuid> stop [base64json] [stream=<name>]\n" api_name " <uuid> <pause|resume> [stream=<name>]\n" api_name         \
-    " <uuid> <mute|unmute> [user|openai|all] [stream=<name>]\n" api_name                                               \
+    " <uuid> <mute|unmute> [send|recv|all] [stream=<name>]\n"                                                          \
+    "  Mute aliases: user=send, openai=recv, both=all. Default target: send.\n" api_name                               \
     " <uuid> send_json <base64json> [stream=<name>]\n"
 
 #define STREAM_API_SYNTAX STREAM_API_SYNTAX_BODY("uuid_openai_audio_stream")
@@ -575,8 +577,9 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
             case STREAM_CMD_UNMUTE: {
                 if (argc > 3) {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lsession), SWITCH_LOG_ERROR,
-                                      "%s accepts at most one target argument (user | openai | all)\n", argv[1]);
-                    stream_fail(&error, "Mute and unmute accept at most one target: user, openai or all");
+                                      "%s accepts at most one target argument (send | recv | all)\n", argv[1]);
+                    stream_fail(&error,
+                                "Mute and unmute accept at most one target: send (user), recv (openai) or all (both)");
                     goto release_session;
                 }
                 const char *target = (argc > 2) ? argv[2] : "user";
