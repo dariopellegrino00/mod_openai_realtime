@@ -127,6 +127,7 @@ The following channel variables configure the WebSocket connection and module lo
 - `STREAM_BUFFER_SIZE` is the duration of each caller-audio chunk sent to the backend. It defaults to the 20 ms FreeSWITCH frame duration.
 - Authenticate official OpenAI endpoints with `STREAM_OPENAI_API_KEY` or an `Authorization` header in
   `STREAM_EXTRA_HEADERS`. Compatible backends may use their own headers or require no authentication.
+- `start` rejects CR/LF characters in the WebSocket URI, extra header names or values, and API key.
 
 - Extra headers should be a JSON object with key-value pairs representing additional HTTP headers. Each key should be a header name, and its corresponding value should be a string.
   ```json

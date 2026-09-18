@@ -143,10 +143,13 @@ static switch_status_t start_capture(switch_core_session_t *session, switch_medi
         .start_muted = start_muted,
         .force_raw_audio_mode = force_raw_audio_mode,
     };
-    if (SWITCH_STATUS_FALSE == stream_session_init(session, responseHandler, &options, &pUserData)) {
+    if (SWITCH_STATUS_FALSE == stream_session_init(session, responseHandler, &options, &pUserData, error)) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "Error initializing mod_openai_audio_stream session.\n");
-        return stream_fail(error, "Failed to initialize stream");
+        if (!error || !error->message[0]) {
+            stream_fail(error, "Failed to initialize stream");
+        }
+        return SWITCH_STATUS_FALSE;
     }
     private_t *tech_pvt = (private_t *)pUserData;
     /* CLOSE may run as soon as add publishes the bug. Keep its context alive until startup completes. */
@@ -297,7 +300,7 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
     char *mycmd = NULL, *argv[8] = {0};
     unsigned int argc = 0;
     void *lifecycle_guard = NULL;
-    stream_error_t error = {"Operation failed"};
+    stream_error_t error = {0};
 
     switch_status_t status = SWITCH_STATUS_FALSE;
 
@@ -493,7 +496,7 @@ respond:
     if (status == SWITCH_STATUS_SUCCESS) {
         stream->write_function(stream, "+OK Success\n");
     } else {
-        stream->write_function(stream, "-ERR %s\n", error.message);
+        stream->write_function(stream, "-ERR %s\n", error.message[0] ? error.message : "Operation failed");
     }
 
 done:

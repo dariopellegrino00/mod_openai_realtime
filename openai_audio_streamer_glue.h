@@ -35,7 +35,7 @@ switch_status_t stream_session_pauseresume(switch_core_session_t *session, int p
 switch_status_t stream_session_set_user_mute(switch_core_session_t *session, int mute, stream_error_t *error);
 switch_status_t stream_session_set_openai_mute(switch_core_session_t *session, int mute, stream_error_t *error);
 switch_status_t stream_session_init(switch_core_session_t *session, responseHandler_t responseHandler,
-                                    const stream_start_options_t *options, void **ppUserData);
+                                    const stream_start_options_t *options, void **ppUserData, stream_error_t *error);
 switch_status_t stream_session_start(void *pUserData);
 void stream_session_release(void *pUserData);
 void *stream_session_lifecycle_lock(switch_core_session_t *session);

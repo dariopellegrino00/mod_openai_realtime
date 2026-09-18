@@ -661,19 +661,29 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
         self.stop_stream()
 
     def test_extra_headers_merge_with_authorization(self):
+        value = 'preserved "quotes"; /?=+ %0D%0A literal\\r\\n \tend'
         extra_headers = json.dumps(
             {
-                "Authorization": "Bearer must-be-replaced",
-                "X-Integration-Test": "preserved",
+                "authorization": "Bearer must-be-replaced",
+                "X-Integration-Test": value,
             },
             separators=(",", ":"),
         )
-        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_EXTRA_HEADERS {extra_headers}")
+        # uuid_setvar consumes one level of backslash escaping.
+        escaped_headers = extra_headers.replace("\\", "\\\\")
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_EXTRA_HEADERS {escaped_headers}")
+        self.assertEqual(api(f"uuid_getvar {self.uuid} STREAM_EXTRA_HEADERS"), extra_headers)
 
-        connected = self.start_stream()
-        self.assertEqual(connected["authorization_headers"], ["Bearer integration-test-key"])
-        self.assertEqual(connected["integration_headers"], ["preserved"])
-        self.stop_stream()
+        for api_key in ("", "integration-test-key"):
+            with self.subTest(api_key=bool(api_key)):
+                assert_ok(self, f"uuid_setvar {self.uuid} STREAM_OPENAI_API_KEY {api_key}")
+                connected = self.start_stream()
+                self.stop_stream()
+                expected_authorization = f"Bearer {api_key}" if api_key else "Bearer must-be-replaced"
+                self.assertEqual(connected["authorization_headers"], [expected_authorization])
+                self.assertEqual(connected["integration_headers"], [value])
+
+        self.assertFalse(any("STREAM_OPENAI_API_KEY is not set" in line for line in self.module_log_lines()))
 
     def test_playback_audio_reaches_channel(self):
         with FreeSwitchEventSocket(self.uuid) as event_socket:

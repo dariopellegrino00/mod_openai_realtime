@@ -159,7 +159,7 @@ bool json_tokens_are_valid(const char *json) {
 }
 
 bool validate_ws_uri(const char *url, char *destination, std::size_t destination_size) {
-    if (!url || !destination || destination_size == 0) {
+    if (!url || !destination || destination_size == 0 || std::strpbrk(url, "\r\n")) {
         return false;
     }
 

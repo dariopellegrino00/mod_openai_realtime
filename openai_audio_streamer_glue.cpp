@@ -56,7 +56,7 @@ struct StreamConfig {
     int heartbeat_seconds;
     bool suppress_log;
     int capture_packet_count;
-    const char *extra_headers;
+    ix::WebSocketHttpHeaders extra_headers;
     bool disable_reconnect;
     const char *tls_ca_file;
     const char *tls_key_file;
@@ -92,30 +92,7 @@ class AudioStreamer {
           m_disable_audiofiles(config.disable_audio_files), m_raw_audio_mode(config.raw_audio_mode),
           m_context(context) {
 
-        ix::WebSocketHttpHeaders headers;
         ix::SocketTLSOptions tlsOptions;
-        if (config.extra_headers) {
-            cJSON *headers_json = cJSON_Parse(config.extra_headers);
-            if (!headers_json || headers_json->type != cJSON_Object) {
-                // misconfigured headers lead to hard-to-diagnose auth failures: make it visible
-                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                                  "(%s) Extra headers are not a valid JSON object, ignoring them\n",
-                                  m_sessionId.c_str());
-            } else {
-                for (cJSON *iterator = headers_json->child; iterator; iterator = iterator->next) {
-                    // iterator->string is null for array elements or malformed properties
-                    if (iterator->type == cJSON_String && iterator->valuestring != nullptr &&
-                        iterator->string != nullptr && *iterator->string != '\0') {
-                        headers[iterator->string] = iterator->valuestring;
-                    } else {
-                        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                                          "(%s) Skipping extra header with invalid name or non-string value\n",
-                                          m_sessionId.c_str());
-                    }
-                }
-            }
-            cJSON_Delete(headers_json);
-        }
 
         webSocket.setUrl(config.websocket_uri);
 
@@ -143,8 +120,8 @@ class AudioStreamer {
         if (config.disable_per_message_deflate)
             webSocket.disablePerMessageDeflate();
 
-        if (!headers.empty())
-            webSocket.setExtraHeaders(headers);
+        if (!config.extra_headers.empty())
+            webSocket.setExtraHeaders(config.extra_headers);
 
         if (config.disable_reconnect)
             webSocket.disableAutomaticReconnection();
@@ -1256,10 +1233,9 @@ switch_status_t stream_session_set_openai_mute(switch_core_session_t *session, i
 }
 
 switch_status_t stream_session_init(switch_core_session_t *session, responseHandler_t responseHandler,
-                                    const stream_start_options_t *options, void **ppUserData) {
+                                    const stream_start_options_t *options, void **ppUserData, stream_error_t *error) {
     int deflate = 0, heart_beat = 0;
     bool suppressLog = false;
-    const char *extra_headers = NULL;
     int rtp_packets = 1;
     bool no_reconnect = false;
     const char *tls_cafile = NULL;
@@ -1269,7 +1245,7 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
     bool tls_disable_hostname_validation = false;
     bool disable_audiofiles = false;
     bool raw_audio_mode = options->force_raw_audio_mode != SWITCH_FALSE;
-    std::string authorization_header_json;
+    StreamConfig config{};
 
     switch_channel_t *channel = switch_core_session_get_channel(session);
 
@@ -1344,52 +1320,44 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
         }
     }
 
-    if (openai_api_key) {
-        // Build the headers via cJSON so the key value gets JSON-escaped, and merge
-        // STREAM_EXTRA_HEADERS instead of ignoring it; Authorization takes precedence.
-        // The std::string work can throw: contain it so it never crosses the extern "C" boundary.
-        try {
-            // Built before any cJSON allocation so a throw here leaks nothing
-            const std::string bearer = "Bearer " + std::string(openai_api_key);
-            cJSON *headers_obj = nullptr;
-            const char *configured_extra = switch_channel_get_variable(channel, "STREAM_EXTRA_HEADERS");
-            if (configured_extra) {
-                headers_obj = cJSON_Parse(configured_extra);
-                if (!headers_obj || headers_obj->type != cJSON_Object) {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-                                      "STREAM_EXTRA_HEADERS is not a valid JSON object, using only Authorization.\n");
-                    cJSON_Delete(headers_obj);
-                    headers_obj = nullptr;
+    // Build the transport headers once; keep allocation failures inside the C++ boundary.
+    try {
+        const char *configured_extra = switch_channel_get_variable(channel, "STREAM_EXTRA_HEADERS");
+        if (configured_extra) {
+            std::unique_ptr<cJSON, decltype(&cJSON_Delete)> headers_json(cJSON_Parse(configured_extra), cJSON_Delete);
+            if (!headers_json || headers_json->type != cJSON_Object) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session),
+                                  openai_api_key ? SWITCH_LOG_WARNING : SWITCH_LOG_ERROR,
+                                  "STREAM_EXTRA_HEADERS is not a valid JSON object, ignoring it.\n");
+            } else {
+                for (cJSON *header = headers_json->child; header; header = header->next) {
+                    if (header->type != cJSON_String || !header->valuestring || !header->string || !*header->string) {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                          "Skipping extra header with invalid name or non-string value\n");
+                        continue;
+                    }
+                    if (std::strpbrk(header->string, "\r\n") || std::strpbrk(header->valuestring, "\r\n")) {
+                        return stream_fail(error, "STREAM_EXTRA_HEADERS names and values must not contain CR or LF");
+                    }
+                    config.extra_headers[header->string] = header->valuestring;
                 }
             }
-            if (!headers_obj) {
-                headers_obj = cJSON_CreateObject();
-            }
-            if (headers_obj) {
-                cJSON_DeleteItemFromObject(headers_obj, "Authorization");
-                cJSON_AddStringToObject(headers_obj, "Authorization", bearer.c_str());
-                char *printed = cJSON_PrintUnformatted(headers_obj);
-                cJSON_Delete(headers_obj); // printed is an independent copy: free the tree now
-                if (printed) {
-                    authorization_header_json.assign(printed);
-                    switch_safe_free(printed);
-                    extra_headers = authorization_header_json.c_str();
-                }
-            }
-        } catch (const std::exception& e) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                              "Failed to build the Authorization header: %s\n", e.what());
-            return SWITCH_STATUS_FALSE;
         }
-        if (!extra_headers) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                              "Failed to build the Authorization header.\n");
-            return SWITCH_STATUS_FALSE;
+
+        if (openai_api_key) {
+            if (std::strpbrk(openai_api_key, "\r\n")) {
+                return stream_fail(error, "STREAM_OPENAI_API_KEY must not contain CR or LF");
+            }
+            // IXWebSocket compares header names case-insensitively; the API key takes precedence.
+            config.extra_headers["Authorization"] = "Bearer " + std::string(openai_api_key);
+        } else if (config.extra_headers.find("Authorization") == config.extra_headers.end()) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                              "STREAM_OPENAI_API_KEY is not set; no Authorization header configured.\n");
         }
-    } else {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-                          "STREAM_OPENAI_API_KEY is not set. Assuming you set STREAM_EXTRA_HEADERS variable.\n");
-        extra_headers = switch_channel_get_variable(channel, "STREAM_EXTRA_HEADERS");
+    } catch (const std::exception& e) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                          "Failed to build WebSocket headers: %s\n", e.what());
+        return stream_fail(error, "Failed to build WebSocket headers");
     }
 
     auto *tech_pvt = static_cast<private_t *>(switch_core_session_alloc(session, sizeof(private_t)));
@@ -1411,7 +1379,6 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
                           options->capture_input_rate);
     }
 
-    StreamConfig config{};
     config.websocket_uri = options->websocket_uri;
     config.capture_input_rate = options->capture_input_rate;
     config.capture_output_rate = options->capture_output_rate;
@@ -1423,7 +1390,6 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
     config.heartbeat_seconds = heart_beat;
     config.suppress_log = suppressLog;
     config.capture_packet_count = rtp_packets;
-    config.extra_headers = extra_headers;
     config.disable_reconnect = no_reconnect;
     config.tls_ca_file = tls_cafile;
     config.tls_key_file = tls_keyfile;

@@ -97,6 +97,7 @@ void test_valid_websocket_uris() {
     expect_valid_uri("ws://127.0.0.1:8080");
     expect_valid_uri("ws://[::1]:8080/path");
     expect_valid_uri("wss://[2001:db8::1]/path");
+    expect_valid_uri("wss://example.test/path%0D%0A?value=%00&other=a%20b");
 }
 
 void test_invalid_websocket_uris() {
@@ -110,6 +111,10 @@ void test_invalid_websocket_uris() {
     expect_invalid_uri("ws://example.test:not-a-port");
     expect_invalid_uri("ws://2001:db8::1");
     expect_invalid_uri("ws://[invalid::address]");
+    for (const char *line_break : {"\r", "\n", "\r\n"}) {
+        expect_invalid_uri((std::string("ws://example.test/path") + line_break + "Injected:yes").c_str());
+        expect_invalid_uri((std::string("wss://example.test?query=") + line_break + "Injected:yes").c_str());
+    }
 
     char destination[5] = "keep";
     CHECK(!stream_protocol::validate_ws_uri("ws://localhost", destination, sizeof(destination)));

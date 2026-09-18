@@ -1,6 +1,7 @@
 """API failures explain the cause without requiring access to FreeSWITCH logs."""
 
 import base64
+import json
 
 from test_module import (
     MOCK_URL,
@@ -15,7 +16,57 @@ from test_module import (
 )
 
 
+def json_api(command, arguments):
+    # JSON escaping carries literal line breaks through the line-based event socket.
+    request = {"command": "fsapi", "data": {"cmd": command, "arg": arguments}}
+    return json.loads(api("json " + json.dumps(request)))["response"]["message"].strip()
+
+
 class ApiErrorsTest(ModuleIntegrationBase):
+    def test_start_rejects_line_breaks_in_extra_headers(self):
+        marker = "private-header-marker"
+        for api_key in ("", "integration-test-key"):
+            assert_ok(self, f"uuid_setvar {self.uuid} STREAM_OPENAI_API_KEY {api_key}")
+            for field in ("name", "value"):
+                for line_break in ("\r", "\n", "\r\n"):
+                    with self.subTest(api_key=bool(api_key), field=field, line_break=repr(line_break)):
+                        name = f"X-{marker}{line_break}Injected" if field == "name" else "X-Test"
+                        value = f"{marker}{line_break}Injected:yes" if field == "value" else marker
+                        headers = json.dumps({name: value}, separators=(",", ":")).replace("\\", "\\\\")
+                        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_EXTRA_HEADERS {headers}")
+                        self.expect_module_errors("Error initializing mod_openai_audio_stream session")
+                        response = assert_error(
+                            self,
+                            f"uuid_openai_audio_stream {self.uuid} start {MOCK_URL} mono",
+                            "STREAM_EXTRA_HEADERS names and values must not contain CR or LF",
+                        )
+                        self.assertNotIn(marker, response)
+
+        self.assertNotIn(marker, "\n".join(self.module_log_lines()))
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_EXTRA_HEADERS")
+        self.start_stream()
+        self.stop_stream()
+
+    def test_start_rejects_line_breaks_in_api_key(self):
+        marker = "private-api-key-marker"
+        for line_break in ("\r", "\n", "\r\n"):
+            with self.subTest(line_break=repr(line_break)):
+                key = f"{marker}{line_break}Injected:yes"
+                self.assertEqual(json_api("uuid_setvar", f"{self.uuid} STREAM_OPENAI_API_KEY {key}"), "+OK")
+                self.assertEqual(json_api("uuid_getvar", f"{self.uuid} STREAM_OPENAI_API_KEY"), key)
+                self.expect_module_errors("Error initializing mod_openai_audio_stream session")
+                response = assert_error(
+                    self,
+                    f"uuid_raw_audio_stream {self.uuid} start {MOCK_URL} mono",
+                    "STREAM_OPENAI_API_KEY must not contain CR or LF",
+                )
+                self.assertNotIn(marker, response)
+
+        self.assertNotIn(marker, "\n".join(self.module_log_lines()))
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_OPENAI_API_KEY integration-test-key")
+        self.start_stream(stream_api="uuid_raw_audio_stream")
+        self.stop_stream(stream_api="uuid_raw_audio_stream")
+
     def test_syntax_errors_return_one_actionable_response(self):
         cases = (
             ("", "Expected a channel UUID and command", "invalid stream command argument count"),
