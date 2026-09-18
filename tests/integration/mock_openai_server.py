@@ -11,6 +11,9 @@ from pathlib import Path
 from websockets.legacy.server import serve
 
 
+MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024  # Keep in sync with openai_audio_streamer_glue.cpp.
+
+
 def pcm16_tone(sample_rate, frequency, duration_seconds, amplitude=12000, start_sample=0):
     sample_count = int(sample_rate * duration_seconds)
     samples = (
@@ -97,7 +100,7 @@ class MockRealtimeServer:
 
                 message_type = payload.get("type", "")
                 if (
-                    path in {"/close-on-command", "/gated-reconnect", "/gated-api-errors"}
+                    path in {"/close-on-command", "/gated-reconnect", "/gated-api-errors", "/rejected-messages"}
                     and message_type == "integration.close"
                 ):
                     await websocket.close(code=1011, reason="intentional paused-close integration test")
@@ -141,6 +144,8 @@ class MockRealtimeServer:
                         await self.send_invalid_audio_base64_boundary_response(websocket)
                     elif path == "/invalid-inbound-json":
                         await self.send_invalid_inbound_json(websocket)
+                    elif path == "/rejected-messages":
+                        await self.send_rejected_messages(websocket)
                     elif path == "/barge-in":
                         await self.send_barge_in_response(websocket)
                     elif path == "/reconnect-during-playback":
@@ -163,6 +168,14 @@ class MockRealtimeServer:
                     await self.send_reused_response_id_audio(websocket)
         finally:
             await self.record("disconnected", path=path)
+
+    async def send_rejected_messages(self, websocket):
+        oversized = "x" * (MAX_WS_MESSAGE_BYTES + 1)
+        for _ in range(3):
+            await websocket.send(b"\x00\x00")
+            await websocket.send(oversized)
+        await websocket.send(json.dumps({"type": "integration.rejections_complete"}))
+        await self.record("rejected-messages-sent")
 
     async def send_audio_delta(self, websocket, response_id, audio):
         await websocket.send(
@@ -457,7 +470,7 @@ class MockRealtimeServer:
         replacement_duration = 0.5
 
         await websocket.send(b"\x7f")
-        await websocket.send(bytes(8 * 1024 * 1024 + 1))
+        await websocket.send(bytes(MAX_WS_MESSAGE_BYTES + 1))
         await websocket.send(pcm16_tone(sample_rate, replacement_frequency, replacement_duration))
         await websocket.send(json.dumps({"type": "response.output_audio.done"}))
         await self.record(

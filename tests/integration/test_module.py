@@ -1174,6 +1174,29 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
         self.assertNotIn(message["error"], diagnostic)
         self.assertNotIn("HTTP status", diagnostic)
 
+    def test_rejected_message_logs_are_bounded_per_connection(self):
+        self.expect_module_errors(*("Dropping oversized text WebSocket message" for _ in range(2)))
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT false")
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            self.start_stream(f"{MOCK_URL}/rejected-messages")
+            for connection in range(2):
+                for _ in range(2):
+                    self.trigger_response("rejected-messages-sent")
+                    processed = event_socket.wait_for(
+                        JSON_EVENT,
+                        predicate=lambda event: "integration.rejections_complete" in event.get("_body", ""),
+                    )
+                    self.assertIsNotNone(processed, "valid messages stopped arriving after rejected frames")
+                if connection == 0:
+                    before = len(mock_events())
+                    close_message = encode_json({"type": "integration.close"})
+                    assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {close_message}")
+                    self.assertIsNotNone(wait_for_event(lambda event: event.get("event") == "connected", before))
+            self.stop_stream()
+
+        binary_warnings = [line for line in self.module_log_lines() if "Received binary WebSocket frame" in line]
+        self.assertEqual(len(binary_warnings), 2, "binary frame warnings were not limited to one per connection")
+
     def test_peer_close_while_paused_cleans_up_without_resume(self):
         before = len(mock_events())
         self.start_stream(f"{MOCK_URL}/close-on-command")

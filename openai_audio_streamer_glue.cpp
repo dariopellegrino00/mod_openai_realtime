@@ -266,10 +266,14 @@ class AudioStreamer {
 
     void handleDataMessage(const ix::WebSocketMessagePtr& message) {
         if (message->str.size() > MAX_WS_MESSAGE_BYTES) {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                              "(%s) Dropping oversized %s WebSocket message (%zu bytes, max %zu)\n",
-                              m_sessionId.c_str(), message->binary ? "binary" : "text", message->str.size(),
-                              MAX_WS_MESSAGE_BYTES);
+            if (!m_oversized_message_logged) {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                                  "(%s) Dropping oversized %s WebSocket message (%zu bytes, max %zu); "
+                                  "further oversized-message logs suppressed until reconnect\n",
+                                  m_sessionId.c_str(), message->binary ? "binary" : "text", message->str.size(),
+                                  MAX_WS_MESSAGE_BYTES);
+                m_oversized_message_logged = true;
+            }
             if (message->binary && m_raw_audio_mode) {
                 resetPlaybackDecoderState();
             }
@@ -287,10 +291,13 @@ class AudioStreamer {
         }
 
         if (!m_raw_audio_mode) {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                              "(%s) Received binary WebSocket frame (%zu bytes) but raw audio mode is not enabled, "
-                              "ignoring\n",
-                              m_sessionId.c_str(), message->str.size());
+            if (!m_unexpected_binary_logged) {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                  "(%s) Received binary WebSocket frame (%zu bytes) but raw audio mode is not enabled, "
+                                  "ignoring; further binary-frame logs suppressed until reconnect\n",
+                                  m_sessionId.c_str(), message->str.size());
+                m_unexpected_binary_logged = true;
+            }
             return;
         }
 
@@ -306,6 +313,8 @@ class AudioStreamer {
     }
 
     void handleConnectionOpen() {
+        m_oversized_message_logged = false;
+        m_unexpected_binary_logged = false;
         // A new connection starts a new PCM stream.
         resetPlaybackDecoderState();
 
@@ -796,6 +805,9 @@ class AudioStreamer {
     private_t *m_context = nullptr;      // owner context; valid until the WebSocket thread has been joined
     uint8_t m_pending_raw_byte = 0;      // trailing odd PCM16 byte carried to the next playback message
     bool m_has_pending_raw_byte = false; // WebSocket thread only
+    // WebSocket-thread-only latches, reset for each connection.
+    bool m_oversized_message_logged = false;
+    bool m_unexpected_binary_logged = false;
 };
 
 class StreamRuntime {
