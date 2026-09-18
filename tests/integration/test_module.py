@@ -72,7 +72,8 @@ def mock_events():
     if not EVENT_LOG.exists():
         return []
     events = []
-    for line in EVENT_LOG.read_text(encoding="utf-8").splitlines():
+    # The mock may still be appending the last record; consume only newline-terminated entries.
+    for line in EVENT_LOG.read_text(encoding="utf-8").split("\n")[:-1]:
         if line:
             events.append(json.loads(line))
     return events

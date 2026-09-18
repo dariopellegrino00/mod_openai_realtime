@@ -10,9 +10,9 @@ set(MODULE_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/..")
 
 enable_testing()
 add_subdirectory(unit)
-add_test(NAME esl COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+add_test(NAME python COMMAND "${Python3_EXECUTABLE}" -m unittest discover
     -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p "test_*.py")
-set_tests_properties(esl PROPERTIES
+set_tests_properties(python PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration"
     TIMEOUT 10)
 

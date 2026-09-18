@@ -25,17 +25,18 @@ Requirements: a C/C++ toolchain, CMake 3.18 or newer, and Python 3.9 or newer. F
 ./tests/run-unit.sh --sanitizers
 ```
 
-CTest runs three C++ executables with 18 cases and five Python ESL cases. The C++ tests compile the production
-`stream_protocol.cpp`, `base64.cpp`, and `playback_queue.cpp`; there are no copied implementations or fake FreeSWITCH
-headers. Their small `CHECK` harness remains active in Release builds. The ESL tests use local socket pairs to check
-fragmentation, timeout recovery, packet deadlines, coalesced packets, filtering, and connection closure.
+CTest runs three C++ executables with 18 cases, five Python ESL cases, and two mock event-log cases. The C++ tests
+compile the production `stream_protocol.cpp`, `base64.cpp`, and `playback_queue.cpp`; there are no copied
+implementations or fake FreeSWITCH headers. Their small `CHECK` harness remains active in Release builds. The ESL
+tests use local socket pairs to check fragmentation, timeout recovery, packet deadlines, coalesced packets,
+filtering, and connection closure.
 
 Normal and sanitized runs use separate directories, `build/tests` and `build/tests-sanitized`. Set `BUILD_DIR` to
 override the directory and `CMAKE_BUILD_PARALLEL_LEVEL` to limit parallel builds. GCC sanitizer runtimes may need
 separate system packages. To run one registered test after building:
 
 ```sh
-ctest --test-dir build/tests --output-on-failure -R '^esl$'
+ctest --test-dir build/tests --output-on-failure -R '^python$'
 ```
 
 ## FreeSWITCH integration
