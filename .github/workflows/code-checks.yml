@@ -33,6 +33,7 @@ jobs:
           shellcheck tests/run-*.sh tests/integration/run.sh
           actionlint
           ruff check tests
+          ruff format --check tests
 
   analyze:
     runs-on: ubuntu-22.04

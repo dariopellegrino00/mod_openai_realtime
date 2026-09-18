@@ -26,10 +26,7 @@ def read_mono_pcm16(path):
     if channels > 1:
         samples = array(
             "h",
-            (
-                sum(samples[index : index + channels]) // channels
-                for index in range(0, len(samples), channels)
-            ),
+            (sum(samples[index : index + channels]) // channels for index in range(0, len(samples), channels)),
         )
     return sample_rate, samples
 

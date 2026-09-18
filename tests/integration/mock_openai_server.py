@@ -10,7 +10,6 @@ from pathlib import Path
 
 from websockets.legacy.server import serve
 
-
 MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024  # Keep in sync with openai_audio_streamer_glue.cpp.
 
 
@@ -124,8 +123,7 @@ class MockRealtimeServer:
                         }
                         if path == "/stereo-capture":
                             audio_event["channel_peak_amplitudes"] = [
-                                max((abs(sample) for sample in samples[channel::2]), default=0)
-                                for channel in range(2)
+                                max((abs(sample) for sample in samples[channel::2]), default=0) for channel in range(2)
                             ]
                         await self.record("audio-received", **audio_event)
                 else:
@@ -389,9 +387,7 @@ class MockRealtimeServer:
         )
         await asyncio.sleep(0.25)
         await websocket.send(json.dumps({"type": "input_audio_buffer.speech_started"}))
-        await websocket.send(
-            json.dumps({"type": "response.output_audio.done", "response_id": interrupted_response_id})
-        )
+        await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": interrupted_response_id}))
 
         # The clear must discard the buffered audio without suppressing subsequent playback.
         await self.send_audio_delta(
@@ -399,9 +395,7 @@ class MockRealtimeServer:
             replacement_response_id,
             pcm16_tone(sample_rate, replacement_frequency, 0.5),
         )
-        await websocket.send(
-            json.dumps({"type": "response.output_audio.done", "response_id": replacement_response_id})
-        )
+        await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": replacement_response_id}))
         await self.record(
             "barge-in-response-sent",
             interrupted_frequency=interrupted_frequency,

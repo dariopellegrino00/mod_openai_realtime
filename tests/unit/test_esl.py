@@ -13,19 +13,14 @@ class EventSocketTest(unittest.TestCase):
         client_socket, self.peer = socket.socketpair()
         self.addCleanup(self.peer.close)
         self.addCleanup(client_socket.close)
-        self.peer.sendall(
-            b"Content-Type: auth/request\n\n"
-            + b"Content-Type: command/reply\nReply-Text: +OK\n\n" * 2
-        )
+        self.peer.sendall(b"Content-Type: auth/request\n\n" + b"Content-Type: command/reply\nReply-Text: +OK\n\n" * 2)
         with patch("esl.socket.create_connection", return_value=client_socket):
             self.client = FreeSwitchEventSocket("test-call")
 
     @staticmethod
     def packet(uuid="test-call", newline=b"\n"):
         body = json.dumps({"Unique-ID": uuid, "Event-Subclass": SPEECH_START_EVENT}).encode()
-        headers = newline.join(
-            [b"Content-Type: text/event-json", f"Content-Length: {len(body)}".encode(), b"", b""]
-        )
+        headers = newline.join([b"Content-Type: text/event-json", f"Content-Length: {len(body)}".encode(), b"", b""])
         return headers + body
 
     def test_timeout_preserves_partial_headers_and_body(self):
@@ -53,8 +48,9 @@ class EventSocketTest(unittest.TestCase):
     def test_packet_deadline_is_not_restarted_for_each_fragment(self):
         fragmented_socket = Mock()
         fragmented_socket.recv.side_effect = [b"Content-Type: text/", b"event-json\n"]
-        with patch.object(self.client, "_socket", fragmented_socket), patch(
-            "esl.time.monotonic", side_effect=[0, 0, 0.6, 1.2]
+        with (
+            patch.object(self.client, "_socket", fragmented_socket),
+            patch("esl.time.monotonic", side_effect=[0, 0, 0.6, 1.2]),
         ):
             with self.assertRaises(socket.timeout):
                 self.client._receive_packet(1)

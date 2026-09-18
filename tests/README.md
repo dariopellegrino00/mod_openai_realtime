@@ -91,6 +91,8 @@ ShellCheck, actionlint, and Ruff. Tests runs the sanitized fast and integration 
 image-publishing workflows run the same suite. Every integration workflow retains logs, mock events, and WAVs as
 artifacts for seven days on failure; `TEST_ARTIFACT_DIR` enables the same collection locally.
 
+To match CI locally, you can install the Ruff version pinned in `ruff.toml` in a `.venv`.
+
 SDK and integration environments in the consumer workflows are pinned to immutable digests. Ordinary pull requests
 build the module and checkout runner without rebuilding FreeSWITCH. `CI Image Checks` builds and tests base-image
 changes before merge. `CI Images` publishes commit tags, tests the published integration digest, and only then
