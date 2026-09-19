@@ -76,10 +76,10 @@ void test_json_tokens() {
     CHECK(!stream_protocol::json_tokens_are_valid(nullptr));
 }
 
-void expect_valid_uri(const char *uri) {
+void expect_valid_uri(const char *uri, const char *expected = nullptr) {
     char destination[256] = {};
     CHECK(stream_protocol::validate_ws_uri(uri, destination, sizeof(destination)));
-    CHECK(std::strcmp(uri, destination) == 0);
+    CHECK(std::strcmp(expected ? expected : uri, destination) == 0);
 }
 
 void expect_invalid_uri(const char *uri) {
@@ -93,7 +93,12 @@ void test_valid_websocket_uris() {
     expect_valid_uri("ws://localhost:8080");
     expect_valid_uri("wss://api.openai.com/v1/realtime?model=test");
     expect_valid_uri("wss://example-host.test:1/path");
-    expect_valid_uri("wss://example.test:65535?query=1");
+    expect_valid_uri("wss://example.test:65535?query=1", "wss://example.test:65535/?query=1");
+    expect_valid_uri("ws://example.test?query=1", "ws://example.test/?query=1");
+    expect_valid_uri("ws://example.test?token=user@other.test", "ws://example.test/?token=user@other.test");
+    expect_valid_uri("ws://[::1]:8080?query=1", "ws://[::1]:8080/?query=1");
+    expect_valid_uri("ws://[::1]?query=1", "ws://[::1]/?query=1");
+    expect_valid_uri("ws://example.test?value=%0D%0A", "ws://example.test/?value=%0D%0A");
     expect_valid_uri("ws://127.0.0.1:8080");
     expect_valid_uri("ws://[::1]:8080/path");
     expect_valid_uri("wss://[2001:db8::1]/path");
@@ -124,14 +129,21 @@ void test_invalid_websocket_uris() {
 }
 
 void test_uri_destination_size_boundary() {
-    const std::string uri = "wss://example.test/path";
-    std::vector<char> exact(uri.size() + 1, 'x');
-    CHECK(stream_protocol::validate_ws_uri(uri.c_str(), exact.data(), exact.size()));
-    CHECK(std::strcmp(exact.data(), uri.c_str()) == 0);
+    const struct {
+        const char *input;
+        const char *output;
+    } cases[] = {{"wss://example.test/path", "wss://example.test/path"},
+                 {"wss://example.test?query=1", "wss://example.test/?query=1"}};
+    for (const auto& uri : cases) {
+        const std::size_t length = std::strlen(uri.output);
+        std::vector<char> exact(length + 1, 'x');
+        CHECK(stream_protocol::validate_ws_uri(uri.input, exact.data(), exact.size()));
+        CHECK(std::strcmp(exact.data(), uri.output) == 0);
 
-    std::vector<char> too_small(uri.size(), 'x');
-    CHECK(!stream_protocol::validate_ws_uri(uri.c_str(), too_small.data(), too_small.size()));
-    CHECK(too_small == std::vector<char>(uri.size(), 'x'));
+        std::vector<char> too_small(length, 'x');
+        CHECK(!stream_protocol::validate_ws_uri(uri.input, too_small.data(), too_small.size()));
+        CHECK(too_small == std::vector<char>(length, 'x'));
+    }
 }
 
 void test_utf8_validation() {

@@ -225,7 +225,8 @@ uuid_openai_audio_stream <uuid> start <ws-uri> <mix-type> [<send-rate>] [<playba
 Attaches a media bug and starts streaming PCM16 audio to the WebSocket server. The default send rate is 24 kHz, matching the OpenAI Realtime API requirement. If `send-rate` differs from the channel codec rate, audio is resampled. Passing `mute_user` delays caller audio until an explicit `unmute`.
 
 - `uuid` - FreeSWITCH channel unique ID
-- `ws-uri` - WebSocket URL using either `ws://` or `wss://`
+- `ws-uri` - WebSocket URL using either `ws://` or `wss://`. A query without a path is preserved by adding `/`:
+  `ws://host?x=1` becomes `ws://host/?x=1`.
 - `mix-type` - choice of
   - "mono" - single channel containing caller's audio
   - "mixed" - single channel containing both caller and callee audio

@@ -1000,6 +1000,12 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
             "WebSocket survived the overlapping stop and hangup",
         )
 
+    def test_query_without_path_reaches_backend(self):
+        query = "?token=integration&encoded=%0D%0A"
+        connected = self.start_stream(f"{MOCK_URL}{query}")
+        self.assertEqual(connected["path"], f"/{query}")
+        self.stop_stream()
+
     def test_reconnects_after_transient_peer_failure(self):
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT false")
         before = len(mock_events())

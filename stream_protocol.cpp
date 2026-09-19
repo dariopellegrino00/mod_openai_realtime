@@ -227,10 +227,19 @@ bool validate_ws_uri(const char *url, char *destination, std::size_t destination
     }
 
     const std::size_t length = std::strlen(url);
-    if (length >= destination_size) {
+    const std::size_t extra_slash = *host_end == '?' ? 1 : 0;
+    if (length >= destination_size - extra_slash) {
         return false;
     }
-    std::memcpy(destination, url, length + 1);
+    if (extra_slash) {
+        // The pinned IXWebSocket parser needs a path before the query.
+        const std::size_t authority_length = static_cast<std::size_t>(host_end - url);
+        std::memcpy(destination, url, authority_length);
+        destination[authority_length] = '/';
+        std::memcpy(destination + authority_length + 1, host_end, length - authority_length + 1);
+    } else {
+        std::memcpy(destination, url, length + 1);
+    }
     return true;
 }
 
