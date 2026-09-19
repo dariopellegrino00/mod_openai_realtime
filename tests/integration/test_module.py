@@ -21,6 +21,7 @@ from audio import (
     tone_runs,
 )
 from esl import (
+    CONNECT_EVENT,
     CONNECTION_ERROR_EVENT,
     JSON_EVENT,
     SPEECH_START_EVENT,
@@ -226,7 +227,9 @@ class ModuleIntegrationBase(unittest.TestCase):
             command += f" {playback_rate}"
         if start_muted:
             command += " mute_user"
-        assert_ok(self, command)
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            assert_ok(self, command)
+            self.assertIsNotNone(event_socket.wait_for(CONNECT_EVENT), "client did not finish connecting")
         connected = wait_for_event(lambda event: event.get("event") == "connected", before)
         self.assertIsNotNone(connected, "module did not connect to the mock WebSocket server")
         return connected
@@ -981,17 +984,20 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
     def test_reconnects_after_transient_peer_failure(self):
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT false")
         before = len(mock_events())
-        first_connection = self.start_stream(f"{MOCK_URL}/reconnect")
-        self.assertEqual(first_connection["connection_number"], 1)
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            first_connection = self.start_stream(f"{MOCK_URL}/reconnect")
+            self.assertEqual(first_connection["connection_number"], 1)
+            self.assertIsNotNone(event_socket.wait_for(CONNECT_EVENT))
 
-        reconnected = wait_for_event(
-            lambda event: event.get("event") == "connected"
-            and event.get("path") == "/reconnect"
-            and event.get("connection_number") == 2,
-            before,
-            timeout=10,
-        )
-        self.assertIsNotNone(reconnected, "module did not reconnect after a transient peer failure")
+            reconnected = wait_for_event(
+                lambda event: event.get("event") == "connected"
+                and event.get("path") == "/reconnect"
+                and event.get("connection_number") == 2,
+                before,
+                timeout=10,
+            )
+            self.assertIsNotNone(reconnected, "module did not reconnect after a transient peer failure")
+            self.assertIsNotNone(event_socket.wait_for(CONNECT_EVENT), "client did not finish reconnecting")
 
         self.trigger_response("audio-response-sent")
         self.stop_stream()
@@ -1008,18 +1014,20 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
 
         before_close = len(mock_events())
         close_message = encode_json({"type": "integration.close"})
-        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {close_message}")
-        closed = wait_for_event(
-            lambda event: event.get("event") == "closed" and event.get("path") == "/close-on-command",
-            before_close,
-        )
-        self.assertIsNotNone(closed, "mock peer did not close the capture stream")
-        reconnected = wait_for_event(
-            lambda event: event.get("event") == "connected",
-            before_close,
-            timeout=10,
-        )
-        self.assertIsNotNone(reconnected, "module did not reconnect after the capture stream was interrupted")
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {close_message}")
+            closed = wait_for_event(
+                lambda event: event.get("event") == "closed" and event.get("path") == "/close-on-command",
+                before_close,
+            )
+            self.assertIsNotNone(closed, "mock peer did not close the capture stream")
+            reconnected = wait_for_event(
+                lambda event: event.get("event") == "connected",
+                before_close,
+                timeout=10,
+            )
+            self.assertIsNotNone(reconnected, "module did not reconnect after the capture stream was interrupted")
+            self.assertIsNotNone(event_socket.wait_for(CONNECT_EVENT), "client did not finish reconnecting")
         reconnected_path = reconnected["path"]
         reconnected_number = reconnected["connection_number"]
 
@@ -1184,6 +1192,7 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
                     before = len(mock_events())
                     close_message = encode_json({"type": "integration.close"})
                     assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {close_message}")
+                    self.assertIsNotNone(event_socket.wait_for(CONNECT_EVENT), "client did not finish reconnecting")
                     self.assertIsNotNone(wait_for_event(lambda event: event.get("event") == "connected", before))
             self.stop_stream()
 

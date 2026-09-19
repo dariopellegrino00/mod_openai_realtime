@@ -8,6 +8,7 @@ SPEECH_START_EVENT = "mod_openai_audio_stream::openai_speech_start"
 SPEECH_STOP_EVENT = "mod_openai_audio_stream::openai_speech_stop"
 JSON_EVENT = "mod_openai_audio_stream::json"
 CONNECTION_ERROR_EVENT = "mod_openai_audio_stream::error"
+CONNECT_EVENT = "mod_openai_audio_stream::connect"
 
 
 class FreeSwitchEventSocket:
@@ -24,7 +25,8 @@ class FreeSwitchEventSocket:
                 raise RuntimeError(f"unexpected FreeSWITCH event socket greeting: {headers}")
             self._command("auth ClueCon")
             self._command(
-                f"event json CUSTOM {SPEECH_START_EVENT} {SPEECH_STOP_EVENT} {JSON_EVENT} {CONNECTION_ERROR_EVENT}"
+                f"event json CUSTOM {SPEECH_START_EVENT} {SPEECH_STOP_EVENT} {JSON_EVENT} "
+                f"{CONNECTION_ERROR_EVENT} {CONNECT_EVENT}"
             )
         except Exception:
             self.close()
