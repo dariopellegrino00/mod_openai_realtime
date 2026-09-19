@@ -61,9 +61,9 @@ module logs, and recorded PCM16 audio.
 `lifecycle_probe.c` is a test-only shared library preloaded into FreeSWITCH. File barriers hold the API stop just
 before removal to verify that capture cannot follow the final payload, including buffered residue. They also let
 hangup enter CLOSE under the FreeSWITCH media-bug lock: stop must finish, the channel must disappear, and the
-WebSocket must disconnect. The runner also requires successful module unload. This exercises the real lock
-ordering without relying on repeated scheduling races. The probe is built only with
-`BUILD_INTEGRATION_TESTS=ON` in the standalone test project; it is never linked into or shipped with the module.
+WebSocket must disconnect. The suite also checks unload refusal with an active stream and successful unload/reload
+after stop. This exercises the real lock ordering without relying on repeated scheduling races. The probe is built
+only with `BUILD_INTEGRATION_TESTS=ON` in the standalone test project; it is never linked into or shipped with the module.
 
 ASan and UBSan cover the module and its compiled IXWebSocket code. FreeSWITCH and SpeexDSP in the base are not fully
 sanitized. LeakSanitizer is disabled inside FreeSWITCH; TSan is not run. The suite does not certify SIP/RTP network

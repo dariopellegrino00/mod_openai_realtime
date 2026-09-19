@@ -11,6 +11,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_openai_audio_stream_load);
 
 SWITCH_MODULE_DEFINITION(mod_openai_audio_stream, mod_openai_audio_stream_load, mod_openai_audio_stream_shutdown, NULL);
 
+static switch_thread_rwlock_t *module_rwlock;
+
 /* freeing a subclass that was not reserved by this module is a harmless no-op */
 static void free_event_subclasses(void) {
     switch_event_free_subclass(EVENT_JSON);
@@ -58,11 +60,13 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
 
     switch (type) {
         case SWITCH_ABC_TYPE_INIT:
-            break;
+            /* Keep the module loaded through CLOSE, including the WebSocket thread join. */
+            return switch_thread_rwlock_rdlock(module_rwlock) == SWITCH_STATUS_SUCCESS;
 
         case SWITCH_ABC_TYPE_CLOSE:
             stream_session_close(session, user_data);
-            break;
+            switch_thread_rwlock_unlock(module_rwlock);
+            return SWITCH_TRUE;
 
         case SWITCH_ABC_TYPE_READ:
             if (switch_atomic_read(&tech_pvt->close_requested)) {
@@ -521,6 +525,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_openai_audio_stream_load) {
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_openai_audio_stream API loading..\n");
 
     *module_interface = switch_loadable_module_create_module_interface(pool, modname);
+    module_rwlock = (*module_interface)->rwlock;
 
     if (switch_event_reserve_subclass(EVENT_JSON) != SWITCH_STATUS_SUCCESS ||
         switch_event_reserve_subclass(EVENT_CONNECT) != SWITCH_STATUS_SUCCESS ||

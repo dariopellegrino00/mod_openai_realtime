@@ -968,6 +968,25 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
         disconnected = wait_for_event(lambda event: event.get("event") == "disconnected", before)
         self.assertIsNotNone(disconnected, "WebSocket did not disconnect after channel hangup")
 
+    def test_unload_refuses_active_stream_and_succeeds_after_stop(self):
+        self.start_stream(start_muted=False)
+        self.assertIsNotNone(
+            wait_for_event(lambda event: event.get("event") == "audio-received", self.event_start),
+            "capture did not reach the backend before unload",
+        )
+        assert_error(self, "unload mod_openai_audio_stream", "Module in use")
+        self.assertTrue(api("status").startswith("UP"))
+        self.trigger_response("audio-response-sent")
+        self.stop_stream()
+
+        assert_ok(self, "unload mod_openai_audio_stream")
+        try:
+            self.assertTrue(api("status").startswith("UP"))
+        finally:
+            assert_ok(self, "load mod_openai_audio_stream")
+        self.start_stream(stream_api="uuid_raw_audio_stream")
+        self.stop_stream(stream_api="uuid_raw_audio_stream")
+
     def test_stop_overlaps_hangup(self):
         self.start_stream()
         before = len(mock_events())

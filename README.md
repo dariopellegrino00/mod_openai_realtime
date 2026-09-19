@@ -68,6 +68,8 @@ sudo make install
 
 TLS support is enabled by default. Pass `-DUSE_TLS=OFF` to CMake to build without TLS support; that build supports `ws://` endpoints but not `wss://` endpoints.
 
+Normal module unload is refused while streams are attached; stop them before unloading.
+
 ### Getting started
 
 #### A simple dialplan example
