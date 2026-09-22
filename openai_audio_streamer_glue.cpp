@@ -1138,10 +1138,14 @@ switch_status_t stream_session_send_json(switch_core_session_t *session, const c
         return stream_fail(error, "JSON payload is not valid UTF-8");
     }
 
+    if (stream_protocol::json_depth_exceeded(decoded_str.c_str(), MAX_JSON_DEPTH)) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                          "stream_session_send_json failed: JSON nested deeper than %d levels.\n", MAX_JSON_DEPTH);
+        return stream_fail(error, "JSON payload exceeds maximum nesting depth");
+    }
+
     const char *parse_end = decoded_str.c_str();
-    cJSON *json_obj = stream_protocol::json_tokens_are_valid(decoded_str.c_str())
-                          ? cJSON_ParseWithOpts(decoded_str.c_str(), &parse_end, 1)
-                          : nullptr;
+    cJSON *json_obj = cJSON_ParseWithOpts(decoded_str.c_str(), &parse_end, 1);
     if (!json_obj) {
         if (streamer->suppress_log()) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,

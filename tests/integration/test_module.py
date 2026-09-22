@@ -1335,35 +1335,45 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
 
         self.stop_stream()
 
-    def test_send_json_rejects_invalid_token_syntax(self):
-        invalid_payloads = (
-            b'{"value":01}',
-            b'{"value":-.1}',
-            b'{"value":1.}',
-            b'{"value":1e+}',
-            b'{"value":"a\nb"}',
-            b'{"value":"a\tb"}',
-            b'{"value":"\\x20"}',
-            b"\f{}\v",
-        )
-        self.expect_module_errors(*("invalid JSON" for _ in invalid_payloads))
-        self.start_stream()
-        for payload in invalid_payloads:
-            with self.subTest(payload=payload):
-                encoded = base64.b64encode(payload).decode("ascii")
-                assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {encoded}")
-        self.stop_stream()
-
-    def test_stop_rejects_invalid_json_token_syntax(self):
-        self.expect_module_errors("invalid JSON")
-        self.start_stream()
-        before = len(mock_events())
-        encoded = base64.b64encode(b'{"value":01}').decode("ascii")
-        assert_error(self, f"uuid_openai_audio_stream {self.uuid} stop {encoded}")
+    def test_cjson_accepted_payload_is_forwarded_unchanged(self):
+        self.start_stream(url=f"{MOCK_URL}/verbatim-text")
+        # cJSON accepts leading zeros; the module leaves syntax validation to that parser.
+        payload = '{"value":01}'
+        encoded = base64.b64encode(payload.encode()).decode("ascii")
+        for command in ("send_json", "stop"):
+            with self.subTest(command=command):
+                before = len(mock_events())
+                assert_ok(self, f"uuid_openai_audio_stream {self.uuid} {command} {encoded}")
+                delivered = wait_for_event(lambda event: event.get("event") == "text-received", before)
+                self.assertIsNotNone(delivered, "cJSON-accepted payload was not delivered")
+                self.assertEqual(delivered["text"], payload)
         self.assertIsNotNone(
             wait_for_event(lambda event: event.get("event") == "disconnected", before),
-            "WebSocket did not disconnect after rejecting the final payload",
+            "WebSocket did not disconnect after the final payload",
         )
+
+    def test_commands_reject_excessive_json_depth(self):
+        self.expect_module_errors(*["JSON nested deeper than 128 levels"] * 2)
+        self.start_stream(url=f"{MOCK_URL}/verbatim-text")
+        before = len(mock_events())
+        payload = '{"value":' + "[" * 128 + "0" + "]" * 128 + "}"
+        encoded = base64.b64encode(payload.encode()).decode("ascii")
+        reason = "JSON payload exceeds maximum nesting depth"
+        assert_error(self, f"uuid_openai_audio_stream {self.uuid} send_json {encoded}", reason)
+
+        valid_payload = '{"type":"integration.after_depth_rejection"}'
+        valid_encoded = base64.b64encode(valid_payload.encode()).decode("ascii")
+        assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {valid_encoded}")
+        self.assertIsNotNone(wait_for_event(lambda event: event.get("text") == valid_payload, before))
+
+        assert_error(
+            self,
+            f"uuid_openai_audio_stream {self.uuid} stop {encoded}",
+            f"Stream stopped; final message failed: {reason}",
+        )
+        self.assertIsNotNone(wait_for_event(lambda event: event.get("event") == "disconnected", before))
+        delivered = [event["text"] for event in mock_events()[before:] if event.get("event") == "text-received"]
+        self.assertEqual(delivered, [valid_payload], "an over-depth payload reached the backend")
 
     def test_stop_rejects_invalid_utf8_final_payload(self):
         self.expect_module_errors("decoded JSON contains invalid UTF-8")

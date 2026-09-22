@@ -91,6 +91,10 @@ class MockRealtimeServer:
                     )
                     continue
 
+                if path == "/verbatim-text":
+                    await self.record("text-received", text=message)
+                    continue
+
                 try:
                     payload = json.loads(message)
                 except json.JSONDecodeError:

@@ -159,10 +159,10 @@ The following channel variables configure the WebSocket connection and module lo
 
 ### Runtime Limits
 
-The module bounds application-level peer processing and playback memory:
+The module bounds JSON nesting, application-level peer processing and playback memory:
 
 - After IXWebSocket has assembled an inbound text or binary message, payloads larger than 8 MiB are dropped before JSON, Base64, or PCM processing. This does not bound WebSocket transport aggregation or decompression.
-- JSON messages nested deeper than 128 levels are dropped.
+- JSON nested deeper than 128 levels is rejected before parsing: backend messages are dropped, while `send_json` and final `stop` payloads return `-ERR` (stop still completes).
 - Decoded playback audio is queued up to 180 seconds. Audio that would exceed this capacity is dropped; overflow logging is re-enabled after the backlog falls below half capacity.
 - Debug WAV files accumulate until stream cleanup, with no per-stream disk limit. Set `STREAM_DISABLE_AUDIOFILES=true` to disable them.
 
@@ -266,9 +266,9 @@ All lifecycle commands (`stop`, `pause`, `resume`, `mute`, `unmute`, and `send_j
 ```text
 uuid_openai_audio_stream <uuid> send_json <base64json>
 ```
-Sends one complete, NUL-free UTF-8 JSON value to the WebSocket endpoint. The command requires structurally valid
-Base64, which protects spaces, newlines, and other characters from FreeSWITCH API parsing. After validation, the
-decoded bytes are forwarded unchanged rather than reserialized.
+Sends one complete, NUL-free UTF-8 JSON value accepted by cJSON to the WebSocket endpoint, without additional
+strict JSON syntax checks. The command requires structurally valid Base64, which protects spaces, newlines, and
+other characters from FreeSWITCH API parsing. The decoded bytes are forwarded unchanged rather than reserialized.
 
 ```text
 uuid_openai_audio_stream <uuid> stop [<base64json>]

@@ -5,77 +5,6 @@
 
 namespace stream_protocol {
 
-namespace {
-
-bool is_json_digit(char c) {
-    return c >= '0' && c <= '9';
-}
-
-bool skip_json_number(const char *& cursor) {
-    if (*cursor == '-') {
-        ++cursor;
-    }
-    if (*cursor == '0') {
-        ++cursor;
-    } else {
-        if (!is_json_digit(*cursor)) {
-            return false;
-        }
-        do {
-            ++cursor;
-        } while (is_json_digit(*cursor));
-    }
-    if (*cursor == '.') {
-        ++cursor;
-        if (!is_json_digit(*cursor)) {
-            return false;
-        }
-        do {
-            ++cursor;
-        } while (is_json_digit(*cursor));
-    }
-    if (*cursor == 'e' || *cursor == 'E') {
-        ++cursor;
-        if (*cursor == '+' || *cursor == '-') {
-            ++cursor;
-        }
-        if (!is_json_digit(*cursor)) {
-            return false;
-        }
-        do {
-            ++cursor;
-        } while (is_json_digit(*cursor));
-    }
-    return *cursor == '\0' || std::strchr(" \t\r\n,]}", *cursor);
-}
-
-bool skip_json_string(const char *& cursor) {
-    ++cursor;
-    while (*cursor != '"') {
-        if (static_cast<unsigned char>(*cursor) < 0x20) {
-            return false;
-        }
-        if (*cursor == '\\') {
-            ++cursor;
-            if (*cursor == 'u') {
-                for (int i = 0; i < 4; ++i) {
-                    ++cursor;
-                    if (!std::isxdigit(static_cast<unsigned char>(*cursor))) {
-                        return false;
-                    }
-                }
-            } else if (!*cursor || !std::strchr("\"\\/bfnrt", *cursor)) {
-                return false;
-            }
-        }
-        ++cursor;
-    }
-    ++cursor;
-    return true;
-}
-
-} // namespace
-
 JsonMessageType classify_json_message(const char *type) {
     if (!type) {
         return JsonMessageType::Unhandled;
@@ -103,8 +32,7 @@ bool json_depth_exceeded(const char *json, int max_depth) {
         return true;
     }
 
-    // FreeSWITCH's bundled cJSON parser is recursive. Reject excessive nesting before parsing so
-    // an untrusted peer cannot exhaust the WebSocket thread's stack.
+    // Bound nesting before FreeSWITCH's recursive cJSON parser uses the calling thread's stack.
     int depth = 0;
     bool in_string = false;
     for (; *json; ++json) {
@@ -128,34 +56,6 @@ bool json_depth_exceeded(const char *json, int max_depth) {
         }
     }
     return false;
-}
-
-bool json_tokens_are_valid(const char *json) {
-    if (!json) {
-        return false;
-    }
-    // cJSON accepts some non-JSON numbers, whitespace and string characters. Check
-    // their spelling before parsing so valid payloads can be forwarded unchanged.
-    while (*json) {
-        if (*json == '"') {
-            if (!skip_json_string(json)) {
-                return false;
-            }
-        } else if (*json == '-' || is_json_digit(*json)) {
-            if (!skip_json_number(json)) {
-                return false;
-            }
-        } else if (std::strchr(" \t\r\n{}[],:", *json)) {
-            ++json;
-        } else if (std::strncmp(json, "true", 4) == 0 || std::strncmp(json, "null", 4) == 0) {
-            json += 4;
-        } else if (std::strncmp(json, "false", 5) == 0) {
-            json += 5;
-        } else {
-            return false;
-        }
-    }
-    return true;
 }
 
 bool validate_ws_uri(const char *url, char *destination, std::size_t destination_size) {
