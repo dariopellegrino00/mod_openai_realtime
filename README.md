@@ -70,6 +70,16 @@ TLS support is enabled by default. Pass `-DUSE_TLS=OFF` to CMake to build withou
 
 Normal module unload is refused while streams are attached; stop them before unloading.
 
+### Tests
+
+From the repository root, run the unit and integration suites with Docker:
+
+```sh
+TEST_ARTIFACT_DIR="$PWD/build/test-artifacts" ./tests/run-integration.sh
+```
+
+See [tests/README.md](tests/README.md) for prerequisites, the fast suite, coverage, and diagnostics.
+
 ### Getting started
 
 #### A simple dialplan example
