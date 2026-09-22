@@ -45,6 +45,16 @@ class EventSocketTest(unittest.TestCase):
         self.assertEqual(event["Unique-ID"], "test-call")
         self.assertEqual(len(self.client.seen_events), 2)
 
+    def test_channel_destroy_is_matched_by_event_name(self):
+        body = json.dumps({"Unique-ID": "test-call", "Event-Name": "CHANNEL_DESTROY"}).encode()
+        self.peer.sendall(
+            self.packet() + f"Content-Type: text/event-json\nContent-Length: {len(body)}\n\n".encode() + body
+        )
+        event = self.client.wait_for("CHANNEL_DESTROY", timeout=1)
+        self.assertIsNotNone(event)
+        self.assertEqual(event["Event-Name"], "CHANNEL_DESTROY")
+        self.assertEqual(len(self.client.seen_events), 2)
+
     def test_packet_deadline_is_not_restarted_for_each_fragment(self):
         fragmented_socket = Mock()
         fragmented_socket.recv.side_effect = [b"Content-Type: text/", b"event-json\n"]

@@ -115,11 +115,13 @@ class ModuleIntegrationBase(unittest.TestCase):
     def setUp(self):
         self.uuid = None
         self.recording = None
+        self.cleanup_events = None
         self.event_start = len(mock_events())
         self.freeswitch_log_start = FREESWITCH_LOG.stat().st_size
         self.expected_module_error_fragments = []
         self.addCleanup(self.cleanup_resources)
         self.originate_call()
+        self.cleanup_events = FreeSwitchEventSocket(self.uuid, events="CHANNEL_DESTROY")
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_OPENAI_API_KEY integration-test-key")
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_DISABLE_AUDIOFILES true")
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT true")
@@ -144,7 +146,15 @@ class ModuleIntegrationBase(unittest.TestCase):
                 uuid = self.uuid
                 self.uuid = None
                 api(f"uuid_kill {uuid}")
+            if self.cleanup_events:
+                self.assertIsNotNone(
+                    self.cleanup_events.wait_for("CHANNEL_DESTROY"),
+                    "channel teardown did not complete before checking module logs",
+                )
         finally:
+            if self.cleanup_events:
+                self.cleanup_events.close()
+                self.cleanup_events = None
             if self.recording and ARTIFACT_DIR is None:
                 self.recording.unlink(missing_ok=True)
 
@@ -651,7 +661,7 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
 
     def test_invalid_capture_buffer_size_uses_default(self):
         default_frame_bytes = 24000 * 20 // 1000 * PCM16_BYTES_PER_SAMPLE
-        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_BUFFER_SIZE 21")
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_BUFFER_SIZE 50")
 
         before = len(mock_events())
         self.start_stream(start_muted=False)
@@ -700,6 +710,15 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
             )
             self.stop_recording()
 
+        self.assert_recording_contains_tone(sent["frequency"], sent["duration_seconds"])
+        self.stop_stream()
+
+    def test_audio_delta_without_response_id_reaches_channel(self):
+        self.start_stream(f"{MOCK_URL}/no-response-id")
+        self.start_recording("no-response-id")
+        sent = self.trigger_response("audio-response-sent")
+        wait_for_realtime_playback(sent["duration_seconds"])
+        self.stop_recording()
         self.assert_recording_contains_tone(sent["frequency"], sent["duration_seconds"])
         self.stop_stream()
 
@@ -1171,14 +1190,17 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
             before = len(mock_events())
             first_connection = self.start_stream(f"{MOCK_URL}/reconnect-during-playback")
             self.assertEqual(first_connection["connection_number"], 1)
+            self.start_recording("reconnect-playback")
 
-            sent = self.trigger_response("reconnect-playback-response-sent")
+            sent = self.trigger_response("queued-playback-response-sent")
 
             started = event_socket.wait_for(SPEECH_START_EVENT)
             self.assertIsNotNone(
                 started,
                 f"module did not emit playback-start before reconnect; observed {event_socket.seen_events}",
             )
+            close_message = encode_json({"type": "integration.close"})
+            assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {close_message}")
             reconnected = wait_for_event(
                 lambda event: event.get("event") == "connected"
                 and event.get("path") == "/reconnect-during-playback"
@@ -1193,7 +1215,31 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
                 stopped,
                 f"module lost playback-stop state across reconnect; observed {event_socket.seen_events}",
             )
+            self.stop_recording()
 
+        self.assert_recording_contains_tone(sent["frequency"], sent["duration_seconds"])
+        self.stop_stream()
+
+    def test_terminal_close_drains_queued_playback(self):
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            self.start_stream(f"{MOCK_URL}/terminal-close-during-playback")
+            self.start_recording("terminal-close-playback")
+            sent = self.trigger_response("queued-playback-response-sent")
+            self.assertIsNotNone(event_socket.wait_for(SPEECH_START_EVENT), "playback did not start before close")
+
+            before_close = len(mock_events())
+            close_message = encode_json({"type": "integration.close"})
+            assert_ok(self, f"uuid_openai_audio_stream {self.uuid} send_json {close_message}")
+            closed = wait_for_event(lambda event: event.get("event") == "closed", before_close)
+            self.assertIsNotNone(closed, "mock did not close the connection while audio was queued")
+            self.assertIsNotNone(
+                event_socket.wait_for(SPEECH_STOP_EVENT, timeout=sent["duration_seconds"] + 3),
+                "terminal close did not complete playback without response.output_audio.done",
+            )
+            self.stop_recording()
+
+        self.assert_recording_contains_tone(sent["frequency"], sent["duration_seconds"])
+        self.restart_after_automatic_cleanup()
         self.stop_stream()
 
     def test_immediate_peer_close_without_reconnect(self):

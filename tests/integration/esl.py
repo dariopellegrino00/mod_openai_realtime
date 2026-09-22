@@ -13,9 +13,9 @@ CONNECT_EVENT = "mod_openai_audio_stream::connect"
 
 
 class FreeSwitchEventSocket:
-    """Minimal inbound ESL client used to observe the module's public custom events."""
+    """Minimal inbound ESL client for module and channel lifecycle events."""
 
-    def __init__(self, unique_id):
+    def __init__(self, unique_id, events=None):
         self._unique_id = unique_id
         self.seen_events = []
         self._socket = socket.create_connection(("127.0.0.1", 8021), timeout=5)
@@ -25,10 +25,12 @@ class FreeSwitchEventSocket:
             if headers.get("content-type") != "auth/request":
                 raise RuntimeError(f"unexpected FreeSWITCH event socket greeting: {headers}")
             self._command("auth ClueCon")
-            self._command(
-                f"event json CUSTOM {SPEECH_START_EVENT} {SPEECH_STOP_EVENT} {JSON_EVENT} "
-                f"{CONNECTION_ERROR_EVENT} {CONNECT_EVENT} {PLAY_EVENT}"
-            )
+            if events is None:
+                events = (
+                    f"CUSTOM {SPEECH_START_EVENT} {SPEECH_STOP_EVENT} {JSON_EVENT} "
+                    f"{CONNECTION_ERROR_EVENT} {CONNECT_EVENT} {PLAY_EVENT}"
+                )
+            self._command(f"event json {events}")
         except Exception:
             self.close()
             raise
@@ -94,7 +96,7 @@ class FreeSwitchEventSocket:
         if headers.get("content-type") != "command/reply" or not headers.get("reply-text", "").startswith("+OK"):
             raise RuntimeError(f"FreeSWITCH event socket command failed: {command}: {headers}")
 
-    def wait_for(self, event_subclass, timeout=5, predicate=None):
+    def wait_for(self, event_name, timeout=5, predicate=None):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
@@ -105,10 +107,11 @@ class FreeSwitchEventSocket:
             if headers.get("content-type") != "text/event-json":
                 continue
             event = json.loads(body)
-            self.seen_events.append((event.get("Unique-ID"), event.get("Event-Subclass")))
+            name = event.get("Event-Subclass") or event.get("Event-Name")
+            self.seen_events.append((event.get("Unique-ID"), name))
             if (
                 event.get("Unique-ID") == self._unique_id
-                and event.get("Event-Subclass") == event_subclass
+                and name == event_name
                 and (predicate is None or predicate(event))
             ):
                 return event

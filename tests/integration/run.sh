@@ -140,7 +140,7 @@ while [ ! -e "${mock_ready}" ]; do
     if ! kill -0 "${mock_pid}" 2>/dev/null; then
         wait "${mock_pid}" || true
         echo "mock WebSocket server exited before becoming ready" >&2
-        cat "${mock_server_log}" >&2
+        cat "${mock_server_log}" >&2 || true
         exit 1
     fi
     attempt=$((attempt + 1))
@@ -227,15 +227,15 @@ if ! python3 -m unittest discover -s "${project_dir}/tests/integration" -p 'test
     if ! kill -0 "${mock_pid}" 2>/dev/null; then
         wait "${mock_pid}" || true
         echo "mock WebSocket server exited during the integration tests:" >&2
-        cat "${mock_server_log}" >&2
+        cat "${mock_server_log}" >&2 || true
     fi
     echo "Mock WebSocket events after integration-test failure:" >&2
-    tail -200 "${mock_log}" >&2
+    tail -200 "${mock_log}" >&2 || true
     echo "FreeSWITCH log after integration-test failure:" >&2
-    tail -200 "${freeswitch_log}" >&2
+    tail -200 "${freeswitch_log}" >&2 || true
     for log in "${freeswitch_runtime_log}" "${freeswitch_local_runtime_log}"; do
         if [ -f "${log}" ]; then
-            tail -200 "${log}" >&2
+            tail -200 "${log}" >&2 || true
         fi
     done
     exit 1
@@ -244,6 +244,6 @@ fi
 if ! kill -0 "${mock_pid}" 2>/dev/null; then
     wait "${mock_pid}" || true
     echo "mock WebSocket server exited before the integration suite completed:" >&2
-    cat "${mock_server_log}" >&2
+    cat "${mock_server_log}" >&2 || true
     exit 1
 fi

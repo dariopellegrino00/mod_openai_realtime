@@ -103,7 +103,15 @@ class MockRealtimeServer:
 
                 message_type = payload.get("type", "")
                 if (
-                    path in {"/close-on-command", "/gated-reconnect", "/gated-api-errors", "/rejected-messages"}
+                    path
+                    in {
+                        "/close-on-command",
+                        "/gated-reconnect",
+                        "/gated-api-errors",
+                        "/rejected-messages",
+                        "/reconnect-during-playback",
+                        "/terminal-close-during-playback",
+                    }
                     and message_type == "integration.close"
                 ):
                     await websocket.close(code=1011, reason="intentional paused-close integration test")
@@ -150,8 +158,8 @@ class MockRealtimeServer:
                         await self.send_rejected_messages(websocket)
                     elif path == "/barge-in":
                         await self.send_barge_in_response(websocket)
-                    elif path == "/reconnect-during-playback":
-                        await self.send_reconnect_during_playback_response(websocket)
+                    elif path in {"/reconnect-during-playback", "/terminal-close-during-playback"}:
+                        await self.send_queued_playback_response(websocket, done=path == "/reconnect-during-playback")
                     elif path == "/flow-control":
                         await self.send_flow_control_response(websocket)
                     elif path == "/debug-audio":
@@ -166,6 +174,8 @@ class MockRealtimeServer:
                         await self.send_raw_audio_boundary_response(websocket)
                     elif path == "/raw-audio-oversized-boundary":
                         await self.send_raw_audio_oversized_boundary_response(websocket)
+                    elif path == "/no-response-id":
+                        await self.send_audio_response(websocket, response_id=None)
                     else:
                         await self.send_audio_response(websocket)
                 elif message_type == "integration.reused_response_id":
@@ -182,23 +192,17 @@ class MockRealtimeServer:
         await self.record("rejected-messages-sent")
 
     async def send_audio_delta(self, websocket, response_id, audio):
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "response.output_audio.delta",
-                    "response_id": response_id,
-                    "delta": base64.b64encode(audio).decode("ascii"),
-                }
-            )
-        )
+        payload = {"type": "response.output_audio.delta", "delta": base64.b64encode(audio).decode("ascii")}
+        if response_id is not None:
+            payload["response_id"] = response_id
+        await websocket.send(json.dumps(payload))
 
-    async def send_audio_response(self, websocket):
+    async def send_audio_response(self, websocket, response_id="integration-response"):
         sample_rate = 24000
         frequency = 1000
         duration_seconds = 0.6
         audio = pcm16_tone(sample_rate, frequency, duration_seconds)
         chunk_sizes = (137, 521, 1003, 269, 1607)
-        response_id = "integration-response"
         await websocket.send(json.dumps({"type": "input_audio_buffer.speech_started"}))
         offset = 0
         chunk_index = 0
@@ -283,27 +287,26 @@ class MockRealtimeServer:
         await websocket.send(delta + "\0garbage")
         await self.record("invalid-inbound-json-sent")
 
-    async def send_reconnect_during_playback_response(self, websocket):
+    async def send_queued_playback_response(self, websocket, done):
         sample_rate = 24000
         frequency = 1100
-        duration_seconds = 2.0
-        response_id = "integration-reconnect-playback-response"
+        duration_seconds = 3.0
+        response_id = "integration-queued-playback-response"
 
-        # Complete the response before dropping the connection. Playback drains in real time,
-        # so the automatic reconnect opens while completed audio is still queued locally.
+        # The test closes the connection after playback starts, while audio is still queued.
         await self.send_audio_delta(
             websocket,
             response_id,
             pcm16_tone(sample_rate, frequency, duration_seconds),
         )
-        await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
+        if done:
+            await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
         await self.record(
-            "reconnect-playback-response-sent",
+            "queued-playback-response-sent",
             response_id=response_id,
             frequency=frequency,
             duration_seconds=duration_seconds,
         )
-        await websocket.close(code=1011, reason="reconnect while completed playback is draining")
 
     async def send_reused_response_id_audio(self, websocket):
         sample_rate = 24000
@@ -384,12 +387,12 @@ class MockRealtimeServer:
         interrupted_response_id = "integration-interrupted-response"
         replacement_response_id = "integration-replacement-response"
 
-        # Queue much more audio than can play before the interruption. This makes the test
-        # distinguish a real buffer clear from merely accepting the speech_started message.
+        # At 8 kHz, three seconds exceed the 16384-sample queue chunk: barge-in must
+        # clear both the C++ queue and the FreeSWITCH playback buffer.
         await self.send_audio_delta(
             websocket,
             interrupted_response_id,
-            pcm16_tone(sample_rate, interrupted_frequency, 2.0),
+            pcm16_tone(sample_rate, interrupted_frequency, 3.0),
         )
         await asyncio.sleep(0.25)
         await websocket.send(json.dumps({"type": "input_audio_buffer.speech_started"}))
