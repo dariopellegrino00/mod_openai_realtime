@@ -37,6 +37,7 @@ jobs:
 
   analyze:
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     container:
       # Published together with the integration digest from main@9b310c95.
       # Update this, build.yml and tests.yml from the same CI Images run.
@@ -72,16 +73,18 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_INTEGRATION_TESTS=ON \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++
 
       - name: Analyze
         shell: bash
         run: |
           set -eux
+          header_filter="^${GITHUB_WORKSPACE}/([^/]+\\.h|tests/.*\\.h)$"
           git ls-files -z -- '*.c' '*.cc' '*.cpp' '*.cxx' ':!:libs' ':!:tests' |
-            xargs -0 -r clang-tidy --config-file=.clang-tidy -p build
+            xargs -0 -r clang-tidy --config-file=.clang-tidy --header-filter="$header_filter" -p build
           git ls-files -z -- 'tests/*.c' 'tests/*.cc' 'tests/*.cpp' 'tests/*.cxx' |
-            xargs -0 -r clang-tidy --config-file=.clang-tidy -p build-tests
+            xargs -0 -r clang-tidy --config-file=.clang-tidy --header-filter="$header_filter" -p build-tests
 
           : > cppcheck-warn.log
           for compile_commands in build/compile_commands.json build-tests/compile_commands.json; do

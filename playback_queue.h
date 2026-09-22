@@ -11,7 +11,7 @@ namespace audio_stream {
 
 class PlaybackQueue {
   public:
-    enum class PushResult {
+    enum class PushResult : std::uint8_t {
         Accepted,
         OverflowStarted,
         OverflowOngoing,
