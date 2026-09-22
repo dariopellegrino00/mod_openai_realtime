@@ -16,6 +16,14 @@ TEST_ARTIFACT_DIR="$PWD/build/test-artifacts" ./tests/run-integration.sh
 module with AddressSanitizer and UndefinedBehaviorSanitizer, then tests it against FreeSWITCH and a local
 WebSocket mock. The container is removed when the run finishes.
 
+To select integration tests, pass module, class or method names (build and unit tests still run):
+
+```sh
+./tests/run-integration.sh test_module.ModuleIntegrationTest.test_barge_in_discards_buffered_audio
+```
+
+Multiple names are accepted; omit them to run the full suite.
+
 `TEST_ARTIFACT_DIR` saves integration logs, mock events, and recorded WAVs on the host, on success or failure.
 The directory is created automatically and is ignored by Git at the path above. Without this variable, those
 files disappear with the container; only terminal output remains. Use a different directory per run to keep
@@ -61,6 +69,15 @@ it is not shipped with the module.
 ASan/UBSan cover the module and its compiled IXWebSocket code, not all of FreeSWITCH or SpeexDSP. LeakSanitizer
 is disabled inside FreeSWITCH; TSan is not run. The suite does not certify real OpenAI behavior, SIP/RTP networking,
 runtime WSS certificate verification, stereo playback codecs, mid-call codec changes, or slow-peer backpressure.
+
+## Writing integration tests
+
+- Add `test_*` methods to `ModuleIntegrationTest`, or subclass `ModuleIntegrationBase` in a `test_*.py` file.
+  Reuse `start_stream`, `trigger_response` and `stop_stream`; the base class handles cleanup and log checks.
+- Declare expected module errors with `expect_module_errors(...)`. Unexpected errors fail the test.
+- Wait for events or observable state changes. Use sleeps only when elapsed time is part of the behavior measured.
+- Assert the result: received messages, recorded audio or state changes, not just command success.
+  A caller tone also enters the recording; restore silence before checking playback silence.
 
 ## Other CI checks
 

@@ -223,7 +223,10 @@ until grep -Fq "mod_openai_audio_stream API successfully loaded" "${FREESWITCH_R
 done
 module_loaded=1
 
-if ! python3 -m unittest discover -s "${project_dir}/tests/integration" -p 'test_*.py' -v; then
+if [ "$#" -eq 0 ]; then
+    set -- discover -p 'test_*.py'
+fi
+if ! (cd "${project_dir}/tests/integration" && python3 -m unittest "$@" -v); then
     if ! kill -0 "${mock_pid}" 2>/dev/null; then
         wait "${mock_pid}" || true
         echo "mock WebSocket server exited during the integration tests:" >&2

@@ -50,7 +50,7 @@ if [ -n "${TEST_ARTIFACT_DIR:-}" ]; then
     docker run --rm \
         --env TEST_ARTIFACT_DIR=/test-artifacts \
         --volume "${artifact_dir}:/test-artifacts:Z" \
-        "${test_image}"
+        "${test_image}" ./tests/run-ci.sh "$@"
 else
-    docker run --rm "${test_image}"
+    docker run --rm "${test_image}" ./tests/run-ci.sh "$@"
 fi

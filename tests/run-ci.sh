@@ -44,4 +44,4 @@ case "${module_dependencies}" in
         ;;
 esac
 
-ENABLE_INTEGRATION_SANITIZERS=1 exec "${project_dir}/tests/integration/run.sh"
+ENABLE_INTEGRATION_SANITIZERS=1 exec "${project_dir}/tests/integration/run.sh" "$@"
