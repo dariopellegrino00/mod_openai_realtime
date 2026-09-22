@@ -66,8 +66,17 @@ runtime WSS certificate verification, stereo playback codecs, mid-call codec cha
 
 The test command does not run lint or static analysis. [Build](../.github/workflows/build.yml) separately checks
 Release builds with TLS on/off; [Static Checks](../.github/workflows/code-checks.yml) runs clang-format,
-clang-tidy, cppcheck, ShellCheck, actionlint, and Ruff. To use CI's Ruff version locally, install the version
-pinned in `ruff.toml` in a `.venv`.
+clang-tidy, cppcheck, ShellCheck, actionlint, and Ruff. To use CI's Ruff version locally:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install ruff==0.12.12
+.venv/bin/ruff check tests
+.venv/bin/ruff format --check tests
+```
+
+Use `.venv/bin/ruff format tests` to format, or `.venv/bin/ruff check --fix tests` to apply lint fixes.
+Alternatively, activate with `. .venv/bin/activate` and run `ruff` without the path prefix.
 
 Integration workflows retain failure artifacts for seven days. CI image build/publish details are in
 [CI Image Checks](../.github/workflows/ci-image-checks.yml) and [CI Images](../.github/workflows/ci-images.yml).

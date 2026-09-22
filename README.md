@@ -294,7 +294,7 @@ Keeps the media bug alive while silencing the selected leg. Defaults to `user` w
 
 - `user`: block caller audio being sent to OpenAI.
 - `openai`: block OpenAI playback from reaching the channel.
-- `all`: attempt both mute operations; an error does not undo either operation.
+- `all` (alias `both`): attempt both mute operations; an error does not undo either operation.
 
 When `mute` changes caller audio from unmuted to muted, the module flushes buffered caller audio and sends
 a block containing one second of silence if the WebSocket is connected.
@@ -339,10 +339,10 @@ In raw audio mode, control messages from the backend, such as `input_audio_buffe
 - `input_audio_buffer.speech_started` is used internally for barge-in, clearing queued playback audio, and is also
   forwarded through the normal JSON event flow. This typically corresponds to VAD being triggered by the backend.
 - `input_audio_buffer.speech_stopped` is logged and forwarded through the normal JSON event flow.
-- `mod_openai_audio_stream::openai_speech_start` is emitted by the module when playback actually starts.
-- `mod_openai_audio_stream::openai_speech_stop` is emitted by the module when playback has fully drained after `response.output_audio.done`, or immediately when playback is interrupted by barge-in.
+- `mod_openai_audio_stream::openai_speech_start` is emitted when playback starts, with body `{"status":"started"}`.
+- `mod_openai_audio_stream::openai_speech_stop` is emitted when playback drains after `response.output_audio.done`, or is interrupted by barge-in, with body `{"status":"stopped"}`.
 
-### response
+### json
 
 Forwards a text message received from the WebSocket endpoint.
 

@@ -246,8 +246,8 @@ static switch_status_t send_json(switch_core_session_t *session, char *json, str
     " <uuid> start <ws-uri> <mono | mixed | stereo>\n"                                                                 \
     "         [send_rate] [playback_rate] [mute_user]\n"                                                               \
     "         where <rate> = 8k|16k|24k or a decimal multiple of 8000 up to 48000\n"                                   \
-    "         send_rate default: 24k, playback_rate default: 24k\n" api_name                                           \
-    " <uuid> [stop | pause | resume]\n" api_name " <uuid> [mute | unmute] [user | openai | all]\n" api_name            \
+    "         send_rate default: 24k, playback_rate default: 24k\n" api_name " <uuid> stop [<base64json>]\n" api_name  \
+    " <uuid> [pause | resume]\n" api_name " <uuid> [mute | unmute] [user | openai | all]\n" api_name                   \
     " <uuid> send_json <base64json>\n"                                                                                 \
     "--------------------------------------------------------------------------------\n"
 
