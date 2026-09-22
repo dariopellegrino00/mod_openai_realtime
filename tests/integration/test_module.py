@@ -24,6 +24,7 @@ from esl import (
     CONNECT_EVENT,
     CONNECTION_ERROR_EVENT,
     JSON_EVENT,
+    PLAY_EVENT,
     SPEECH_START_EVENT,
     SPEECH_STOP_EVENT,
     FreeSwitchEventSocket,
@@ -817,6 +818,41 @@ class ModuleIntegrationTest(ModuleIntegrationBase):
 
         self.stop_stream()
         self.assertTrue(wait_until(lambda: not debug_file.exists()), "debug WAV survived stream teardown")
+
+    def test_duplicate_audio_delta_fields_are_stripped_only_after_decoding(self):
+        self.expect_module_errors("base64 decode error")
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_DISABLE_AUDIOFILES false")
+        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_SUPPRESS_LOG false")
+        with FreeSwitchEventSocket(self.uuid) as event_socket:
+            self.start_stream(f"{MOCK_URL}/duplicate-audio-delta")
+            sent = self.trigger_response("duplicate-audio-delta-sent")
+            for event_type, response_id in (
+                (JSON_EVENT, "duplicate-fragment"),
+                (PLAY_EVENT, "duplicate-audio"),
+            ):
+                event = event_socket.wait_for(event_type, predicate=lambda event: response_id in event.get("_body", ""))
+                self.assertIsNotNone(event, f"missing {event_type} for {response_id}")
+                payload = json.loads(event["_body"])
+                self.assertEqual(payload["type"], "response.output_audio.delta")
+                self.assertEqual(payload["response_id"], response_id)
+                self.assertFalse(any(key.lower() == "delta" for key in payload), payload)
+                if event_type == PLAY_EVENT:
+                    with wave.open(payload["file"], "rb") as recording:
+                        self.assertEqual(recording.getnframes() * recording.getsampwidth(), sent["byte_count"])
+
+            rejected = event_socket.wait_for(
+                JSON_EVENT, predicate=lambda event: "duplicate-invalid" in event.get("_body", "")
+            )
+            self.assertIsNotNone(rejected, "invalid Base64 was not forwarded")
+            self.assertEqual(rejected["_body"], sent["rejected_message"])
+        self.stop_stream()
+
+        for response_id in ("duplicate-fragment", "duplicate-audio"):
+            logged = [line for line in self.module_log_lines() if response_id in line and "Received message:" in line]
+            self.assertTrue(logged, f"missing debug log for {response_id}")
+            for line in logged:
+                payload = json.loads(line.split("Received message: ", 1)[1])
+                self.assertFalse(any(key.lower() == "delta" for key in payload), payload)
 
     def test_raw_audio_streams_binary_pcm_in_both_directions(self):
         stream_api = "uuid_raw_audio_stream"

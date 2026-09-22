@@ -152,6 +152,8 @@ class MockRealtimeServer:
                         await self.send_flow_control_response(websocket)
                     elif path == "/debug-audio":
                         await self.send_debug_audio_response(websocket)
+                    elif path == "/duplicate-audio-delta":
+                        await self.send_duplicate_audio_delta_response(websocket)
                     elif path == "/raw-audio":
                         await self.send_raw_audio_response(websocket)
                     elif path == "/raw-audio-debug":
@@ -411,6 +413,23 @@ class MockRealtimeServer:
         await self.send_audio_delta(websocket, response_id, audio[1:])
         await websocket.send(json.dumps({"type": "response.output_audio.done", "response_id": response_id}))
         await self.record("debug-audio-response-sent", sample_rate=sample_rate, byte_count=len(audio))
+
+    async def send_duplicate_audio_delta_response(self, websocket):
+        audio = pcm16_tone(24000, 1000, 0.1)
+        rejected_message = None
+        for response_id, encoded in (
+            ("duplicate-fragment", base64.b64encode(audio[:1]).decode("ascii")),
+            ("duplicate-audio", base64.b64encode(audio[1:]).decode("ascii")),
+            ("duplicate-invalid", "A"),
+        ):
+            payload = json.dumps({"type": "response.output_audio.delta", "response_id": response_id, "delta": encoded})
+            # A dict cannot represent repeated keys; exercise both exact and case-insensitive duplicates.
+            message = payload[:-1] + ',"delta":"duplicate-payload-marker","Delta":"case-duplicate-marker"}'
+            await websocket.send(message)
+            if response_id == "duplicate-invalid":
+                rejected_message = message
+        await websocket.send(json.dumps({"type": "response.output_audio.done"}))
+        await self.record("duplicate-audio-delta-sent", rejected_message=rejected_message, byte_count=len(audio))
 
     async def send_raw_audio_response(self, websocket):
         sample_rate = 8000

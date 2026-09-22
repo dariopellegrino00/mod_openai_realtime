@@ -618,7 +618,13 @@ class AudioStreamer {
 
         // The audio payload was already decoded: strip the base64 from the copies used for
         // events and logs (the README documents EVENT_PLAY as replacing it with the file path).
-        cJSON_DeleteItemFromObject(json, "delta");
+        for (cJSON *item = json->child; item;) {
+            cJSON *next = item->next;
+            if (item->string && strcasecmp(item->string, "delta") == 0) {
+                cJSON_Delete(cJSON_DetachItemViaPointer(json, item));
+            }
+            item = next;
+        }
 
         std::string aligned_audio;
         auto resampled = convertRawAudio(raw_audio, m_disable_audiofiles ? nullptr : &aligned_audio);

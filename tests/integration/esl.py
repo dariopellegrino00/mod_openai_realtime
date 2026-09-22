@@ -7,6 +7,7 @@ import time
 SPEECH_START_EVENT = "mod_openai_audio_stream::openai_speech_start"
 SPEECH_STOP_EVENT = "mod_openai_audio_stream::openai_speech_stop"
 JSON_EVENT = "mod_openai_audio_stream::json"
+PLAY_EVENT = "mod_openai_audio_stream::play"
 CONNECTION_ERROR_EVENT = "mod_openai_audio_stream::error"
 CONNECT_EVENT = "mod_openai_audio_stream::connect"
 
@@ -26,7 +27,7 @@ class FreeSwitchEventSocket:
             self._command("auth ClueCon")
             self._command(
                 f"event json CUSTOM {SPEECH_START_EVENT} {SPEECH_STOP_EVENT} {JSON_EVENT} "
-                f"{CONNECTION_ERROR_EVENT} {CONNECT_EVENT}"
+                f"{CONNECTION_ERROR_EVENT} {CONNECT_EVENT} {PLAY_EVENT}"
             )
         except Exception:
             self.close()
